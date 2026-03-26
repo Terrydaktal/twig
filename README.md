@@ -31,7 +31,7 @@ Primary goals:
   - Defines CLI flags/options (`clap` derive)
   - Scans directory entries with `jwalk`
   - Computes size fields (`-s` vs `-S`)
-  - Computes Git columns (`--git`, `--git-repos`)
+  - Computes Git columns (`--git`)
   - Styles output using `LS_COLORS`
   - Handles symlink arrows/targets and broken-link highlighting
   - Writes optional raw path caches for shell integration
@@ -66,7 +66,8 @@ From `twig --help`:
 
 - `-a, --all` list all files, including hidden
 - `-A, --almost-all` list hidden but exclude `.` and `..`
-- `-l, --long` shorthand for `-psot`
+- `-l, --long` shorthand for `-Lptos --show-targets`
+- `-L, --list` force one-entry-per-line list mode
 - `-p, --permissions` show permission bits
 - `-s, --size` show logical file size and allocated dir size
 - `-o, --owner` show file owner
@@ -76,8 +77,11 @@ From `twig --help`:
 - `--sort <name|type|date|size>` sort key (default `type`)
 - `-r, --reverse` reverse listing order
 - `--hyperlink` render names as OSC8 hyperlinks
-- `--git` show staged/unstaged two-character Git status
-- `--git-repos` show repo-root status column
+- `-x, --show-targets` show symlink target paths
+- `--git` smart Git columns:
+  - file staged/unstaged status when listing path is in a Git repo
+  - repo-root status markers when listed entries include Git repo roots
+- `-d, --dereference` use symlink target size/time fields for `-s`/`-S`/`-t`
 - `-S, --true-size` show allocated file size + recursive allocated dir size
 - `-H, --no-dedupe-hardlinks` disable hardlink dedupe for `-S`
 - `--cache-raw` write listed full paths for dirs/files to `/tmp/fzf-history-$USER/...`
@@ -97,8 +101,8 @@ For each invocation, `twig` runs roughly this pipeline:
 5. If `--hyperlink` is set and shown file count exceeds `1000`, hyperlinks are silently disabled.
 6. Sort entries by selected key, apply reverse if requested.
 7. Optionally populate Git columns:
-   - `--git` status pair per top-level entry
-   - `--git-repos` repo-root cleanliness marker
+   - file status pair when listing path is inside a Git repo
+   - repo-root cleanliness marker when listed entries include Git repo roots
 8. Optionally write raw path cache files (`--cache-raw`).
 9. Render all rows into one buffered `String`.
 10. Single `stdout.lock().write_all(...)` write.
@@ -110,10 +114,16 @@ For each invocation, `twig` runs roughly this pipeline:
 - `-s` / `--size`
   - Files: logical byte size (`metadata.len()`)
   - Dirs: allocated blocks for that directory entry (`st_blocks * 512`)
+  - With `-d` on symlink entries:
+    - symlink -> file: logical target file size
+    - symlink -> dir: allocated blocks of target directory
 
 - `-S` / `--true-size`
   - Files: allocated blocks (`st_blocks * 512`)
   - Dirs: recursive allocated total (directory + descendants)
+  - With `-d` on symlink entries:
+    - symlink -> file: allocated blocks of target file
+    - symlink -> dir: recursive allocated total of target directory
 
 ### Hardlink Deduplication (`-S` mode)
 
@@ -157,7 +167,7 @@ Color mapping:
 - `D`/`U`: red
 - `-`/`I`: dimmed
 
-### `--git-repos` repository status (directory roots)
+### Repo-root status (under `--git`)
 
 Shown only for directory entries that are Git roots:
 - `|` clean repo (green)
@@ -203,7 +213,7 @@ PID suffix resolution order:
 
 - Compact mode (default): names separated by two spaces, single row
 - Detailed mode: one row per entry when any of:
-  - `-p`, `-s`, `-o`, `-g`, `-t`, `-l`, `--git`, `--git-repos`, `-S`
+  - `-L`, `-p`, `-s`, `-o`, `-g`, `-t`, `-l`, `--git`, `-S`
 
 Detailed row columns are assembled left-to-right as enabled:
 1. permissions
@@ -212,8 +222,8 @@ Detailed row columns are assembled left-to-right as enabled:
 4. group
 5. modified time
 6. git status pair (`--git`)
-7. repo status marker (`--git-repos`)
-8. styled name (and symlink target arrow when applicable)
+7. repo status marker (`--git`)
+8. styled name (and symlink target arrow when `-x`/`--show-targets` is active)
 
 ## Practical Examples
 
@@ -227,6 +237,12 @@ Detailed row columns are assembled left-to-right as enabled:
 # Include hidden files and classify entries
 ./target/release/twig -aF ~
 
+# List-only mode without metadata columns
+./target/release/twig -L ~/Dev
+
+# Show symlink targets in compact mode
+./target/release/twig -x /home/lewis/.local/bin/twig
+
 # True size with hardlink dedupe (default)
 ./target/release/twig -S ~/Downloads
 
@@ -236,8 +252,8 @@ Detailed row columns are assembled left-to-right as enabled:
 # Git-aware long listing
 ./target/release/twig -l --git .
 
-# Show Git root status for child directories
-./target/release/twig -l --git-repos ~/src
+# Show Git root status for child directories (same --git flag)
+./target/release/twig -l --git ~/src
 
 # Reverse by date
 ./target/release/twig --sort date -r

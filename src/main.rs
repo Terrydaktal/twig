@@ -6,10 +6,11 @@ use lscolors::{LsColors, Style};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use users::{get_group_by_gid, get_user_by_uid};
@@ -25,6 +26,29 @@ enum SortBy {
     Type,
     Date,
     Size,
+    #[value(name = "dircount")]
+    DirCount,
+    #[value(name = "filecount")]
+    FileCount,
+}
+
+#[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
+enum ColorMode {
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailColumn {
+    Perms,
+    SizeLogical,
+    DirCount,
+    FileCount,
+    Owner,
+    Time,
+    Group,
+    SizeTrue,
+    Git,
 }
 
 #[derive(Parser)]
@@ -42,9 +66,13 @@ struct Cli {
     #[arg(short = 'A', long)]
     almost_all: bool,
 
-    /// Use a long listing format (short for -psot)
+    /// Use a long listing format (short for -Lptos --show-targets)
     #[arg(short, long)]
     long: bool,
+
+    /// List one entry per line
+    #[arg(short = 'L', long = "list")]
+    list: bool,
 
     /// Show permissions
     #[arg(short, long)]
@@ -53,6 +81,10 @@ struct Cli {
     /// Show size: files use logical bytes; dirs use allocated blocks
     #[arg(short, long)]
     size: bool,
+
+    /// Show recursive directory and file counts for directories
+    #[arg(short = 'c', long = "counts")]
+    counts: bool,
 
     /// Show owner user
     #[arg(short, long)]
@@ -78,17 +110,29 @@ struct Cli {
     #[arg(short, long)]
     reverse: bool,
 
+    /// Control colorized output
+    #[arg(long, value_enum, default_value = "always")]
+    color: ColorMode,
+
     /// Render names as terminal hyperlinks
-    #[arg(long)]
+    #[arg(short = 'U', long)]
     hyperlink: bool,
 
-    /// Show Git staged/unstaged status as a two-character column
-    #[arg(long)]
-    git: bool,
+    /// Show symlink targets
+    #[arg(short = 'x', long = "show-targets")]
+    show_targets: bool,
 
-    /// Show Git repository status for directories that are repository roots
-    #[arg(long = "git-repos")]
-    git_repos: bool,
+    /// Show absolute paths in output
+    #[arg(short = 'X', long = "absolute")]
+    absolute: bool,
+
+    /// Dereference symlink targets for size/time calculations
+    #[arg(short = 'd', long = "dereference")]
+    dereference: bool,
+
+    /// Show Git columns: file status in repos and repo-root status for listed repo dirs
+    #[arg(short = 'G', long)]
+    git: bool,
 
     /// Show true size: files use allocated blocks; dirs use recursive allocated blocks
     #[arg(short = 'S', long = "true-size")]
@@ -108,6 +152,10 @@ struct Cli {
     #[arg(long)]
     cache_raw: bool,
 
+    /// Show a header row for list/detailed output
+    #[arg(long)]
+    header: bool,
+
     /// The path to list
     #[arg(default_value = ".")]
     path: String,
@@ -115,75 +163,207 @@ struct Cli {
 
 struct Context {
     lscolors: LsColors,
+    color_enabled: bool,
     classify: bool,
-    size_requested: bool,
     show_perms: bool,
-    show_size: bool,
+    show_size_logical: bool,
+    show_size_true: bool,
+    show_counts: bool,
     show_owner: bool,
     show_group: bool,
     show_time: bool,
     hyperlink: bool,
+    show_targets: bool,
+    absolute: bool,
+    dereference: bool,
     show_git: bool,
     show_git_repos: bool,
-    true_size: bool,
+    show_hidden: bool,
+    dedupe_hardlinks: bool,
+    reverse: bool,
+    header: bool,
+    column_preference: Vec<DetailColumn>,
     sort_by: SortBy,
 }
 
 struct EntryInfo {
     display_name: String,
+    render_name: String,
     actual_path: PathBuf,
     metadata: fs::Metadata,
     is_symlink: bool,
     is_dir: bool,
     is_target_dir: bool,
     is_hidden: bool,
-    size_str: String,
+    logical_size_str: String,
+    true_size_str: String,
+    dir_count_str: String,
+    file_count_str: String,
     user_str: String,
     group_str: String,
     time_str: String,
     final_size: u64,
+    dir_count: u64,
+    file_count: u64,
+    sort_mtime: i64,
     symlink_target: Option<PathBuf>,
     broken_symlink: bool,
     git_status: Option<(char, char)>,
     repo_status: Option<char>,
 }
 
+fn push_unique_column(columns: &mut Vec<DetailColumn>, column: DetailColumn) {
+    if !columns.contains(&column) {
+        columns.push(column);
+    }
+}
+
+fn parse_detail_column_preference() -> Vec<DetailColumn> {
+    let mut columns = Vec::new();
+    let mut stop_parsing_flags = false;
+
+    for arg in std::env::args_os().skip(1) {
+        let arg = arg.to_string_lossy();
+        if stop_parsing_flags {
+            continue;
+        }
+        if arg == "--" {
+            stop_parsing_flags = true;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            match long {
+                "permissions" => push_unique_column(&mut columns, DetailColumn::Perms),
+                "size" => push_unique_column(&mut columns, DetailColumn::SizeLogical),
+                "counts" => {
+                    push_unique_column(&mut columns, DetailColumn::DirCount);
+                    push_unique_column(&mut columns, DetailColumn::FileCount);
+                }
+                "owner" => push_unique_column(&mut columns, DetailColumn::Owner),
+                "modified" => push_unique_column(&mut columns, DetailColumn::Time),
+                "group" => push_unique_column(&mut columns, DetailColumn::Group),
+                "true-size" => push_unique_column(&mut columns, DetailColumn::SizeTrue),
+                "git" => push_unique_column(&mut columns, DetailColumn::Git),
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(shorts) = arg.strip_prefix('-') {
+            if shorts.is_empty() {
+                continue;
+            }
+            for ch in shorts.chars() {
+                match ch {
+                    'p' => push_unique_column(&mut columns, DetailColumn::Perms),
+                    's' => push_unique_column(&mut columns, DetailColumn::SizeLogical),
+                    'c' => {
+                        push_unique_column(&mut columns, DetailColumn::DirCount);
+                        push_unique_column(&mut columns, DetailColumn::FileCount);
+                    }
+                    'o' => push_unique_column(&mut columns, DetailColumn::Owner),
+                    't' => push_unique_column(&mut columns, DetailColumn::Time),
+                    'g' => push_unique_column(&mut columns, DetailColumn::Group),
+                    'S' => push_unique_column(&mut columns, DetailColumn::SizeTrue),
+                    'G' => push_unique_column(&mut columns, DetailColumn::Git),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    columns
+}
+
+fn is_detail_column_enabled(column: DetailColumn, ctx: &Context) -> bool {
+    match column {
+        DetailColumn::Perms => ctx.show_perms,
+        DetailColumn::SizeLogical => ctx.show_size_logical,
+        DetailColumn::DirCount | DetailColumn::FileCount => ctx.show_counts,
+        DetailColumn::Owner => ctx.show_owner,
+        DetailColumn::Time => ctx.show_time,
+        DetailColumn::Group => ctx.show_group,
+        DetailColumn::SizeTrue => ctx.show_size_true,
+        DetailColumn::Git => ctx.show_git || ctx.show_git_repos,
+    }
+}
+
+fn build_detail_columns(ctx: &Context) -> Vec<DetailColumn> {
+    let mut columns = Vec::new();
+    for column in &ctx.column_preference {
+        if is_detail_column_enabled(*column, ctx) {
+            push_unique_column(&mut columns, *column);
+        }
+    }
+    for column in [
+        DetailColumn::Perms,
+        DetailColumn::SizeLogical,
+        DetailColumn::DirCount,
+        DetailColumn::FileCount,
+        DetailColumn::Owner,
+        DetailColumn::Time,
+        DetailColumn::Group,
+        DetailColumn::SizeTrue,
+        DetailColumn::Git,
+    ] {
+        if is_detail_column_enabled(column, ctx) {
+            push_unique_column(&mut columns, column);
+        }
+    }
+    columns
+}
+
 fn main() {
     let cli = Cli::parse();
-    let lscolors = LsColors::from_env().unwrap_or_default();
     let show_hidden = cli.all || cli.almost_all;
+
+    let piped_output = !io::stdout().is_terminal();
+    let color_enabled = matches!(cli.color, ColorMode::Always) && !piped_output;
+    let classify_enabled = cli.classify && !piped_output;
+    let hyperlink_enabled = cli.hyperlink && !piped_output;
+    let cache_raw_enabled = cli.cache_raw && !piped_output;
+    let lscolors = LsColors::from_env().unwrap_or_default();
 
     let mut ctx = Context {
         lscolors,
-        classify: cli.classify,
-        size_requested: cli.size || cli.long || cli.true_size,
+        color_enabled,
+        classify: classify_enabled,
         show_perms: cli.permissions || cli.long,
-        show_size: cli.size || cli.long || cli.true_size,
+        show_size_logical: cli.size || cli.long,
+        show_size_true: cli.true_size,
+        show_counts: cli.counts,
         show_owner: cli.owner || cli.long,
         show_group: cli.group,
         show_time: cli.modified || cli.long,
-        hyperlink: cli.hyperlink,
-        show_git: cli.git,
-        show_git_repos: cli.git_repos,
-        true_size: cli.true_size,
+        hyperlink: hyperlink_enabled,
+        show_targets: cli.show_targets || cli.long,
+        absolute: cli.absolute,
+        dereference: cli.dereference,
+        show_git: false,
+        show_git_repos: false,
+        show_hidden,
+        dedupe_hardlinks: cli.dedupe_hardlinks,
+        reverse: cli.reverse,
+        header: cli.header,
+        column_preference: parse_detail_column_preference(),
         sort_by: cli.sort,
     };
-
-    let is_detailed = ctx.show_perms
-        || ctx.show_size
-        || ctx.show_owner
-        || ctx.show_group
-        || ctx.show_time
-        || ctx.show_git
-        || ctx.show_git_repos;
     let mut entries = Vec::new();
-    let recursive_sizes = if cli.true_size {
-        collect_recursive_sizes(Path::new(&cli.path), show_hidden, cli.dedupe_hardlinks)
-    } else {
-        HashMap::new()
-    };
+    let need_counts = cli.counts || matches!(cli.sort, SortBy::DirCount | SortBy::FileCount);
+    let (recursive_sizes, recursive_counts) = collect_recursive_stats(
+        Path::new(&cli.path),
+        show_hidden,
+        cli.dedupe_hardlinks,
+        cli.true_size,
+        need_counts,
+    );
+    let mut user_cache: HashMap<u32, String> = HashMap::new();
+    let mut group_cache: HashMap<u32, String> = HashMap::new();
 
-    if cli.all {
+    let input_path = Path::new(&cli.path);
+    let input_meta = fs::symlink_metadata(input_path).ok();
+    let input_is_dir = input_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+
+    if cli.all && input_is_dir {
         if let Ok(m) = fs::symlink_metadata(&cli.path) {
             entries.push(create_entry_info(
                 ".",
@@ -191,6 +371,9 @@ fn main() {
                 m,
                 &ctx,
                 &recursive_sizes,
+                &recursive_counts,
+                &mut user_cache,
+                &mut group_cache,
             ));
         }
         let parent_path = if cli.path == "." {
@@ -205,44 +388,67 @@ fn main() {
                 m,
                 &ctx,
                 &recursive_sizes,
+                &recursive_counts,
+                &mut user_cache,
+                &mut group_cache,
             ));
         }
     }
 
-    let walk_dir = WalkDir::new(&cli.path)
-        .max_depth(1)
-        .skip_hidden(!show_hidden);
+    if input_is_dir {
+        let walk_dir = WalkDir::new(&cli.path)
+            .max_depth(1)
+            .skip_hidden(!show_hidden);
 
-    for entry in walk_dir {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if entry.depth == 0 {
-            continue;
+        for entry in walk_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.depth == 0 {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            entries.push(create_entry_info(
+                &file_name,
+                entry.path(),
+                metadata,
+                &ctx,
+                &recursive_sizes,
+                &recursive_counts,
+                &mut user_cache,
+                &mut group_cache,
+            ));
         }
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let file_name = entry.file_name().to_string_lossy().to_string();
+    } else if let Some(metadata) = input_meta {
+        let file_name = input_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| cli.path.clone());
         entries.push(create_entry_info(
             &file_name,
-            entry.path(),
+            PathBuf::from(&cli.path),
             metadata,
             &ctx,
             &recursive_sizes,
+            &recursive_counts,
+            &mut user_cache,
+            &mut group_cache,
         ));
     }
 
     if entries.is_empty() {
-        if cli.cache_raw {
+        if cache_raw_enabled {
             let _ = write_cache_raw_paths(&[], &[]);
         }
         return;
     }
 
-    if cli.hyperlink {
+    if ctx.hyperlink {
         let shown_file_count = entries
             .iter()
             .filter(|entry| {
@@ -270,8 +476,8 @@ fn main() {
                 return a_name.cmp(&b_name);
             }
             SortBy::Date => {
-                let a_time = a.metadata.mtime();
-                let b_time = b.metadata.mtime();
+                let a_time = a.sort_mtime;
+                let b_time = b.sort_mtime;
                 if a_time != b_time {
                     return b_time.cmp(&a_time);
                 }
@@ -281,6 +487,16 @@ fn main() {
                 let b_rank = get_custom_type_rank(b);
                 if a_rank != b_rank {
                     return a_rank.cmp(&b_rank);
+                }
+            }
+            SortBy::DirCount => {
+                if a.dir_count != b.dir_count {
+                    return b.dir_count.cmp(&a.dir_count);
+                }
+            }
+            SortBy::FileCount => {
+                if a.file_count != b.file_count {
+                    return b.file_count.cmp(&a.file_count);
                 }
             }
             SortBy::Name => {}
@@ -294,33 +510,59 @@ fn main() {
         entries.reverse();
     }
 
-    if ctx.show_git || ctx.show_git_repos {
-        populate_git_columns(
-            Path::new(&cli.path),
-            &mut entries,
-            ctx.show_git,
-            ctx.show_git_repos,
-        );
+    if cli.git {
+        let (show_git_status, show_repo_status) =
+            populate_git_columns(Path::new(&cli.path), &mut entries);
+        ctx.show_git = show_git_status;
+        ctx.show_git_repos = show_repo_status;
     }
 
-    if cli.cache_raw {
+    if cache_raw_enabled {
         let (shown_dir_paths, shown_file_paths) = collect_output_paths(&entries);
         if let Err(err) = write_cache_raw_paths(&shown_dir_paths, &shown_file_paths) {
             eprintln!("failed to write --cache-raw files: {}", err);
         }
     }
 
-    let output = if is_detailed {
-        print_detailed_list(&entries, &ctx)
+    let detail_columns = build_detail_columns(&ctx);
+    let is_list_mode = piped_output || cli.list || cli.header || !detail_columns.is_empty();
+
+    let output = if is_list_mode {
+        print_detailed_list(&entries, &ctx, &detail_columns)
     } else {
         let mut out = String::new();
         for entry in &entries {
-            out.push_str(&get_styled_name(
-                &entry.display_name,
-                &entry.actual_path,
-                &entry.metadata,
-                &ctx,
-            ));
+            if entry.is_symlink && entry.broken_symlink {
+                let mut broken_text =
+                    get_display_name_text(&entry.render_name, &entry.metadata, &ctx);
+                if ctx.show_targets {
+                    if let Some(target) = entry.symlink_target.as_ref() {
+                        broken_text.push_str(" -> ");
+                        broken_text.push_str(&target.to_string_lossy());
+                    }
+                }
+                out.push_str(&highlight_broken_symlink_text(
+                    &broken_text,
+                    ctx.color_enabled,
+                ));
+            } else {
+                out.push_str(&get_styled_name(
+                    &entry.render_name,
+                    &entry.actual_path,
+                    &entry.metadata,
+                    &ctx,
+                ));
+                if ctx.show_targets {
+                    if let Some(target) = entry.symlink_target.as_ref() {
+                        out.push_str(" -> ");
+                        out.push_str(&get_symlink_target_display(
+                            &entry.actual_path,
+                            target,
+                            &ctx,
+                        ));
+                    }
+                }
+            }
             out.push_str("  ");
         }
         out.push('\n');
@@ -350,14 +592,12 @@ fn collect_output_paths(entries: &[EntryInfo]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (dir_paths, file_paths)
 }
 
-fn populate_git_columns(
-    listing_path: &Path,
-    entries: &mut [EntryInfo],
-    show_git: bool,
-    show_git_repos: bool,
-) {
-    if show_git {
-        let status_map = collect_git_statuses_for_listing(listing_path).unwrap_or_default();
+fn populate_git_columns(listing_path: &Path, entries: &mut [EntryInfo]) -> (bool, bool) {
+    let listing_abs = fs::canonicalize(listing_path).unwrap_or_else(|_| to_full_path(listing_path));
+
+    let show_git_status = git_repo_root(&listing_abs).is_some();
+    if show_git_status {
+        let status_map = collect_git_statuses_for_listing(&listing_abs).unwrap_or_default();
         for entry in entries.iter_mut() {
             let status = status_map
                 .get(&entry.display_name)
@@ -367,19 +607,24 @@ fn populate_git_columns(
         }
     }
 
-    if show_git_repos {
-        for entry in entries.iter_mut() {
-            let is_dirish = if entry.is_symlink {
-                entry.is_target_dir
-            } else {
-                entry.is_dir
-            };
-            if !is_dirish {
-                continue;
-            }
-            entry.repo_status = git_repo_root_status(&entry.actual_path);
+    let mut show_repo_status = false;
+    for entry in entries.iter_mut() {
+        let is_dirish = if entry.is_symlink {
+            entry.is_target_dir
+        } else {
+            entry.is_dir
+        };
+        if !is_dirish {
+            continue;
         }
+        let repo_status = git_repo_root_status(&entry.actual_path);
+        if repo_status.is_some() {
+            show_repo_status = true;
+        }
+        entry.repo_status = repo_status;
     }
+
+    (show_git_status, show_repo_status)
 }
 
 fn collect_git_statuses_for_listing(listing_path: &Path) -> Option<HashMap<String, (char, char)>> {
@@ -571,6 +816,14 @@ fn git_repo_status_style(symbol: char) -> nu_ansi_term::Style {
     }
 }
 
+fn paint_if_enabled(style: nu_ansi_term::Style, text: &str, enabled: bool) -> String {
+    if enabled {
+        style.paint(text).to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 fn get_custom_type_rank(e: &EntryInfo) -> u8 {
     let is_dir = if e.is_symlink {
         e.is_target_dir
@@ -592,16 +845,23 @@ fn on_disk_size(metadata: &fs::Metadata) -> u64 {
     metadata.blocks() * 512
 }
 
-fn collect_recursive_sizes(
+fn collect_recursive_stats(
     base_path: &Path,
     show_hidden: bool,
     dedupe_hardlinks: bool,
-) -> HashMap<OsString, u64> {
+    need_sizes: bool,
+    need_counts: bool,
+) -> (HashMap<OsString, u64>, HashMap<OsString, (u64, u64)>) {
+    if !need_sizes && !need_counts {
+        return (HashMap::new(), HashMap::new());
+    }
+
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
     let scan_root = canonical_base.clone();
-    let dir_local_sums = Arc::new(Mutex::new(HashMap::<PathBuf, u64>::new()));
-    let shared_sums = Arc::clone(&dir_local_sums);
-    let seen_inodes = if dedupe_hardlinks {
+    // Top-level keyed aggregation: key is immediate child directory name.
+    let dir_local_stats = Arc::new(Mutex::new(HashMap::<OsString, (u64, u64, u64)>::new()));
+    let shared_stats = Arc::clone(&dir_local_stats);
+    let seen_inodes = if need_sizes && dedupe_hardlinks {
         Some(Arc::new(Mutex::new(HashSet::<(u64, u64)>::new())))
     } else {
         None
@@ -617,90 +877,144 @@ fn collect_recursive_sizes(
                 scan_root.join(path)
             };
 
-            let mut local_sum = 0u64;
-            let mut hardlink_candidates: Vec<(u64, u64, u64)> = Vec::new();
+            let rel = match current_path.strip_prefix(&canonical_base) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut rel_components = rel.components();
+            let first_component = rel_components.next();
 
-            for child in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
-                if let Ok(metadata) = child.metadata() {
-                    if shared_seen.is_none() || metadata.is_dir() || metadata.nlink() <= 1 {
-                        local_sum += on_disk_size(&metadata);
-                    } else {
-                        hardlink_candidates.push((
-                            metadata.dev(),
-                            metadata.ino(),
-                            on_disk_size(&metadata),
-                        ));
+            let mut local_updates: HashMap<OsString, (u64, u64, u64)> = HashMap::new();
+
+            // Root callback: seed top-level dir entries and add each top-level dir's own size.
+            if first_component.is_none() {
+                for child in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
+                    if !child.file_type().is_dir() {
+                        continue;
+                    }
+                    let key = child.file_name().to_os_string();
+                    let stats = local_updates.entry(key).or_insert((0, 0, 0));
+                    if need_sizes {
+                        if let Ok(metadata) = child.metadata() {
+                            stats.0 += on_disk_size(&metadata);
+                        }
                     }
                 }
-            }
+            } else {
+                // Non-root callback: all children belong to the same top-level bucket.
+                let top_level_name = match first_component {
+                    Some(Component::Normal(name)) => name.to_os_string(),
+                    _ => return,
+                };
 
-            if let Some(ref seen) = shared_seen {
-                if !hardlink_candidates.is_empty() {
-                    if let Ok(mut set) = seen.lock() {
-                        for (dev, ino, size) in hardlink_candidates {
-                            if set.insert((dev, ino)) {
-                                local_sum += size;
+                let mut local_size = 0u64;
+                let mut local_dirs = 0u64;
+                let mut local_files = 0u64;
+                let mut hardlink_candidates: Vec<(u64, u64, u64)> = Vec::new();
+
+                for child in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
+                    let ft = child.file_type();
+                    if need_counts {
+                        if ft.is_dir() {
+                            local_dirs += 1;
+                        } else {
+                            local_files += 1;
+                        }
+                    }
+                    if need_sizes {
+                        if let Ok(metadata) = child.metadata() {
+                            if shared_seen.is_none() || metadata.is_dir() || metadata.nlink() <= 1 {
+                                local_size += on_disk_size(&metadata);
+                            } else {
+                                hardlink_candidates.push((
+                                    metadata.dev(),
+                                    metadata.ino(),
+                                    on_disk_size(&metadata),
+                                ));
                             }
                         }
                     }
                 }
+
+                if let Some(ref seen) = shared_seen {
+                    if !hardlink_candidates.is_empty() {
+                        if let Ok(mut set) = seen.lock() {
+                            for (dev, ino, size) in hardlink_candidates {
+                                if set.insert((dev, ino)) {
+                                    local_size += size;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                local_updates.insert(top_level_name, (local_size, local_dirs, local_files));
             }
 
-            if let Ok(mut sums) = shared_sums.lock() {
-                sums.insert(current_path, local_sum);
+            if let Ok(mut stats) = shared_stats.lock() {
+                for (key, value) in local_updates {
+                    let entry = stats.entry(key).or_insert((0, 0, 0));
+                    entry.0 += value.0;
+                    entry.1 += value.1;
+                    entry.2 += value.2;
+                }
             }
         })
         .into_iter()
         .for_each(|_| {});
 
-    let mut aggregated = match Arc::try_unwrap(dir_local_sums) {
+    let top_level_stats = match Arc::try_unwrap(dir_local_stats) {
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
         Err(shared) => shared.lock().map(|m| m.clone()).unwrap_or_default(),
     };
 
-    aggregated.entry(canonical_base.clone()).or_insert(0);
-    let mut paths: Vec<PathBuf> = aggregated.keys().cloned().collect();
-    paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
+    let mut recursive_sizes: HashMap<OsString, u64> = HashMap::new();
+    let mut recursive_counts: HashMap<OsString, (u64, u64)> = HashMap::new();
 
-    for path in paths {
-        if path == canonical_base {
-            continue;
+    for (name, stats) in top_level_stats {
+        if need_sizes {
+            recursive_sizes.insert(name.clone(), stats.0);
         }
-
-        if let Some(parent) = path.parent() {
-            if !(parent == canonical_base || parent.starts_with(&canonical_base)) {
-                continue;
-            }
-
-            let value = aggregated.get(&path).copied().unwrap_or(0);
-            *aggregated.entry(parent.to_path_buf()).or_insert(0) += value;
+        if need_counts {
+            recursive_counts.insert(name, (stats.1, stats.2));
         }
     }
 
-    let mut recursive_sizes: HashMap<OsString, u64> = HashMap::new();
-    for (path, descendant_sum) in aggregated {
-        if path.parent() != Some(canonical_base.as_path()) {
-            continue;
-        }
+    (recursive_sizes, recursive_counts)
+}
 
-        let metadata = match fs::symlink_metadata(&path) {
+fn recursive_dir_on_disk_size(base_path: &Path, show_hidden: bool, dedupe_hardlinks: bool) -> u64 {
+    let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+    let mut total = 0u64;
+    let mut seen_inodes = if dedupe_hardlinks {
+        Some(HashSet::<(u64, u64)>::new())
+    } else {
+        None
+    };
+
+    for entry in WalkDir::new(&canonical_base).skip_hidden(!show_hidden) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
         };
 
-        if !metadata.is_dir() {
-            continue;
+        if let Some(seen) = seen_inodes.as_mut() {
+            if !metadata.is_dir() && metadata.nlink() > 1 {
+                let inode_key = (metadata.dev(), metadata.ino());
+                if !seen.insert(inode_key) {
+                    continue;
+                }
+            }
         }
 
-        if let Some(name) = path.file_name() {
-            recursive_sizes.insert(
-                name.to_os_string(),
-                on_disk_size(&metadata) + descendant_sum,
-            );
-        }
+        total += on_disk_size(&metadata);
     }
 
-    recursive_sizes
+    total
 }
 
 fn create_entry_info(
@@ -709,59 +1023,121 @@ fn create_entry_info(
     metadata: fs::Metadata,
     ctx: &Context,
     recursive_sizes: &HashMap<OsString, u64>,
+    recursive_counts: &HashMap<OsString, (u64, u64)>,
+    user_cache: &mut HashMap<u32, String>,
+    group_cache: &mut HashMap<u32, String>,
 ) -> EntryInfo {
     let is_symlink = metadata.file_type().is_symlink();
     let is_dir = metadata.is_dir();
     let is_hidden = display_name.starts_with('.') && display_name != "." && display_name != "..";
+    let render_name = if ctx.absolute {
+        normalize_path_lexical(&to_full_path(&actual_path))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        display_name.to_string()
+    };
 
     let mut is_target_dir = false;
     let mut symlink_target = None;
     let mut broken_symlink = false;
+    let mut target_meta: Option<fs::Metadata> = None;
     if is_symlink {
         symlink_target = fs::read_link(&actual_path).ok();
-        let target_meta = fs::metadata(&actual_path).ok();
+        target_meta = fs::metadata(&actual_path).ok();
         is_target_dir = target_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         broken_symlink = target_meta.is_none();
     }
 
-    let final_size = if ctx.true_size {
-        recursive_sizes
-            .get(OsStr::new(display_name))
-            .copied()
-            .unwrap_or_else(|| on_disk_size(&metadata))
+    let logical_size = if is_symlink && ctx.dereference && !broken_symlink {
+        match target_meta.as_ref() {
+            Some(meta) if meta.is_dir() => on_disk_size(meta),
+            Some(meta) => meta.len(),
+            None => {
+                if is_dir {
+                    on_disk_size(&metadata)
+                } else {
+                    metadata.len()
+                }
+            }
+        }
     } else if is_dir {
         on_disk_size(&metadata)
     } else {
         metadata.len()
     };
 
-    let size_str = if (is_dir || (is_symlink && is_target_dir))
-        && !ctx.size_requested
-        && ctx.sort_by != SortBy::Size
-        && !ctx.true_size
-    {
-        "-".to_string()
+    let true_size = if is_symlink && ctx.dereference && !broken_symlink {
+        match target_meta.as_ref() {
+            Some(meta) if meta.is_dir() => {
+                recursive_dir_on_disk_size(&actual_path, ctx.show_hidden, ctx.dedupe_hardlinks)
+            }
+            Some(meta) => on_disk_size(meta),
+            None => on_disk_size(&metadata),
+        }
+    } else if is_dir {
+        recursive_sizes
+            .get(OsStr::new(display_name))
+            .copied()
+            .unwrap_or_else(|| on_disk_size(&metadata))
     } else {
-        format_size(final_size)
+        on_disk_size(&metadata)
     };
 
+    let final_size = if ctx.show_size_true {
+        true_size
+    } else {
+        logical_size
+    };
+    let logical_size_str = format_size(logical_size);
+    let true_size_str = format_size(true_size);
+    let (dir_count, file_count) = if is_dir {
+        recursive_counts
+            .get(OsStr::new(display_name))
+            .copied()
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    let dir_count_str = dir_count.to_string();
+    let file_count_str = file_count.to_string();
+
     let user_str = if ctx.show_owner {
-        get_user_by_uid(metadata.uid())
-            .map(|u| u.name().to_string_lossy().into_owned())
-            .unwrap_or_else(|| metadata.uid().to_string())
+        user_cache
+            .entry(metadata.uid())
+            .or_insert_with(|| {
+                get_user_by_uid(metadata.uid())
+                    .map(|u| u.name().to_string_lossy().into_owned())
+                    .unwrap_or_else(|| metadata.uid().to_string())
+            })
+            .clone()
     } else {
         String::new()
     };
     let group_str = if ctx.show_group {
-        get_group_by_gid(metadata.gid())
-            .map(|g| g.name().to_string_lossy().into_owned())
-            .unwrap_or_else(|| metadata.gid().to_string())
+        group_cache
+            .entry(metadata.gid())
+            .or_insert_with(|| {
+                get_group_by_gid(metadata.gid())
+                    .map(|g| g.name().to_string_lossy().into_owned())
+                    .unwrap_or_else(|| metadata.gid().to_string())
+            })
+            .clone()
     } else {
         String::new()
     };
 
+    let sort_mtime = if is_symlink && ctx.dereference && !broken_symlink {
+        target_meta
+            .as_ref()
+            .map(|m| m.mtime())
+            .unwrap_or_else(|| metadata.mtime())
+    } else {
+        metadata.mtime()
+    };
+
     let time_str = if ctx.show_time {
-        let mtime = metadata.mtime();
+        let mtime = sort_mtime;
         let dt: DateTime<Local> = DateTime::from_timestamp(mtime, 0)
             .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
             .with_timezone(&Local);
@@ -777,17 +1153,24 @@ fn create_entry_info(
 
     EntryInfo {
         display_name: display_name.to_string(),
+        render_name,
         actual_path,
         metadata,
         is_symlink,
         is_dir,
         is_target_dir,
         is_hidden,
-        size_str,
+        logical_size_str,
+        true_size_str,
+        dir_count_str,
+        file_count_str,
         user_str,
         group_str,
         time_str,
         final_size,
+        dir_count,
+        file_count,
+        sort_mtime,
         symlink_target,
         broken_symlink,
         git_status: None,
@@ -795,113 +1178,222 @@ fn create_entry_info(
     }
 }
 
-fn print_detailed_list(entries: &[EntryInfo], ctx: &Context) -> String {
-    let (mut max_size, mut max_user, mut max_group, mut max_time) = (0, 0, 0, 0);
+fn print_detailed_list(entries: &[EntryInfo], ctx: &Context, columns: &[DetailColumn]) -> String {
+    let (
+        mut max_size_logical,
+        mut max_size_true,
+        mut max_dir_count,
+        mut max_file_count,
+        mut max_user,
+        mut max_group,
+        mut max_time,
+    ) = (0, 0, 0, 0, 0, 0, 0);
     for e in entries {
-        max_size = max_size.max(e.size_str.len());
+        max_size_logical = max_size_logical.max(e.logical_size_str.len());
+        max_size_true = max_size_true.max(e.true_size_str.len());
+        max_dir_count = max_dir_count.max(e.dir_count_str.len());
+        max_file_count = max_file_count.max(e.file_count_str.len());
         max_user = max_user.max(e.user_str.len());
         max_group = max_group.max(e.group_str.len());
         max_time = max_time.max(e.time_str.len());
     }
+    if ctx.header {
+        max_size_logical = max_size_logical.max("SIZE".len());
+        max_size_true = max_size_true.max("TSIZE".len());
+        max_dir_count = max_dir_count.max("DIRS".len());
+        max_file_count = max_file_count.max("FILES".len());
+        max_user = max_user.max("OWNER".len());
+        max_group = max_group.max("GROUP".len());
+        max_time = max_time.max("MODIFIED".len());
+    }
 
     let mut out = String::new();
+    let header_row = if ctx.header {
+        let mut header = String::new();
+        for column in columns {
+            if !header.is_empty() {
+                header.push(' ');
+            }
+            match column {
+                DetailColumn::Perms => {
+                    header.push_str(&format!("{:<10}", "PERMS"));
+                }
+                DetailColumn::SizeLogical => {
+                    header.push_str(&format!("{:>width$}", "SIZE", width = max_size_logical));
+                }
+                DetailColumn::SizeTrue => {
+                    header.push_str(&format!("{:>width$}", "TSIZE", width = max_size_true));
+                }
+                DetailColumn::DirCount => {
+                    header.push_str(&format!("{:>width$}", "DIRS", width = max_dir_count));
+                }
+                DetailColumn::FileCount => {
+                    header.push_str(&format!("{:>width$}", "FILES", width = max_file_count));
+                }
+                DetailColumn::Owner => {
+                    header.push_str(&format!("{:<width$}", "OWNER", width = max_user));
+                }
+                DetailColumn::Time => {
+                    header.push_str(&format!("{:<width$}", "MODIFIED", width = max_time));
+                }
+                DetailColumn::Group => {
+                    header.push_str(&format!("{:<width$}", "GROUP", width = max_group));
+                }
+                DetailColumn::Git => {
+                    header.push_str("GIT");
+                }
+            }
+        }
+        if !header.is_empty() {
+            header.push(' ');
+        }
+        header.push_str("NAME");
+        paint_if_enabled(nu_ansi_term::Style::default().bold(), &header, ctx.color_enabled)
+    } else {
+        String::new()
+    };
+
+    if ctx.header && !ctx.reverse {
+        out.push_str(&header_row);
+        out.push('\n');
+    }
+
     for e in entries {
         let mut row = String::new();
-        if ctx.show_perms {
-            let ft = if e.is_dir {
-                paint_text_with_lscolors("d", &e.actual_path, &e.metadata, ctx)
-            } else if e.is_symlink {
-                nu_ansi_term::Color::LightCyan.bold().paint("l").to_string()
-            } else {
-                nu_ansi_term::Color::White.bold().paint("-").to_string()
-            };
-            row.push_str(&ft);
-            row.push_str(&format_permissions(e.metadata.permissions().mode()));
-        }
-        if ctx.show_size {
+        for column in columns {
             if !row.is_empty() {
                 row.push(' ');
             }
-            row.push_str(
-                &nu_ansi_term::Color::LightCyan
-                    .bold()
-                    .paint(format!("{:>width$}", e.size_str, width = max_size))
-                    .to_string(),
-            );
-        }
-        if ctx.show_owner {
-            if !row.is_empty() {
-                row.push(' ');
+            match column {
+                DetailColumn::Perms => {
+                    let ft = if e.is_dir {
+                        paint_text_with_lscolors("d", &e.actual_path, &e.metadata, ctx)
+                    } else if e.is_symlink {
+                        paint_if_enabled(
+                            nu_ansi_term::Color::LightCyan.bold(),
+                            "l",
+                            ctx.color_enabled,
+                        )
+                    } else {
+                        paint_if_enabled(nu_ansi_term::Color::White.bold(), "-", ctx.color_enabled)
+                    };
+                    row.push_str(&ft);
+                    row.push_str(&format_permissions(
+                        e.metadata.permissions().mode(),
+                        ctx.color_enabled,
+                    ));
+                }
+                DetailColumn::SizeLogical => {
+                    let size_text =
+                        format!("{:>width$}", e.logical_size_str, width = max_size_logical);
+                    row.push_str(&paint_if_enabled(
+                        nu_ansi_term::Color::LightCyan.bold(),
+                        &size_text,
+                        ctx.color_enabled,
+                    ));
+                }
+                DetailColumn::SizeTrue => {
+                    let size_text = format!("{:>width$}", e.true_size_str, width = max_size_true);
+                    row.push_str(&paint_if_enabled(
+                        nu_ansi_term::Color::LightCyan.bold(),
+                        &size_text,
+                        ctx.color_enabled,
+                    ));
+                }
+                DetailColumn::DirCount => {
+                    let count_text = format!("{:>width$}", e.dir_count_str, width = max_dir_count);
+                    row.push_str(&paint_if_enabled(
+                        nu_ansi_term::Color::Yellow.bold(),
+                        &count_text,
+                        ctx.color_enabled,
+                    ));
+                }
+                DetailColumn::FileCount => {
+                    let count_text =
+                        format!("{:>width$}", e.file_count_str, width = max_file_count);
+                    row.push_str(&paint_if_enabled(
+                        nu_ansi_term::Color::Yellow.bold(),
+                        &count_text,
+                        ctx.color_enabled,
+                    ));
+                }
+                DetailColumn::Owner => {
+                    row.push_str(&format!("{:<width$}", e.user_str, width = max_user));
+                }
+                DetailColumn::Time => {
+                    let time_text = format!("{:<width$}", e.time_str, width = max_time);
+                    row.push_str(&paint_if_enabled(
+                        nu_ansi_term::Style::default().dimmed(),
+                        &time_text,
+                        ctx.color_enabled,
+                    ));
+                }
+                DetailColumn::Group => {
+                    row.push_str(&format!("{:<width$}", e.group_str, width = max_group));
+                }
+                DetailColumn::Git => {
+                    if ctx.show_git {
+                        let (staged, unstaged) = e.git_status.unwrap_or(('-', '-'));
+                        row.push_str(&paint_if_enabled(
+                            git_symbol_style(staged),
+                            &staged.to_string(),
+                            ctx.color_enabled,
+                        ));
+                        row.push_str(&paint_if_enabled(
+                            git_symbol_style(unstaged),
+                            &unstaged.to_string(),
+                            ctx.color_enabled,
+                        ));
+                    }
+                    if ctx.show_git_repos {
+                        if ctx.show_git {
+                            row.push(' ');
+                        }
+                        let repo_status = e.repo_status.unwrap_or(' ');
+                        row.push_str(&paint_if_enabled(
+                            git_repo_status_style(repo_status),
+                            &repo_status.to_string(),
+                            ctx.color_enabled,
+                        ));
+                    }
+                }
             }
-            row.push_str(&format!("{:<width$}", e.user_str, width = max_user));
-        }
-        if ctx.show_group {
-            if !row.is_empty() {
-                row.push(' ');
-            }
-            row.push_str(&format!("{:<width$}", e.group_str, width = max_group));
-        }
-        if ctx.show_time {
-            if !row.is_empty() {
-                row.push(' ');
-            }
-            row.push_str(
-                &nu_ansi_term::Style::default()
-                    .dimmed()
-                    .paint(format!("{:<width$}", e.time_str, width = max_time))
-                    .to_string(),
-            );
-        }
-        if ctx.show_git {
-            if !row.is_empty() {
-                row.push(' ');
-            }
-            let (staged, unstaged) = e.git_status.unwrap_or(('-', '-'));
-            row.push_str(
-                &git_symbol_style(staged)
-                    .paint(staged.to_string())
-                    .to_string(),
-            );
-            row.push_str(
-                &git_symbol_style(unstaged)
-                    .paint(unstaged.to_string())
-                    .to_string(),
-            );
-        }
-        if ctx.show_git_repos {
-            if !row.is_empty() {
-                row.push(' ');
-            }
-            let repo_status = e.repo_status.unwrap_or(' ');
-            row.push_str(
-                &git_repo_status_style(repo_status)
-                    .paint(repo_status.to_string())
-                    .to_string(),
-            );
         }
         if !row.is_empty() {
             row.push(' ');
         }
         if e.is_symlink && e.broken_symlink {
-            let mut broken_text = get_display_name_text(&e.display_name, &e.metadata, ctx);
-            if let Some(target) = e.symlink_target.as_ref() {
-                broken_text.push_str(" -> ");
-                broken_text.push_str(&target.to_string_lossy());
+            let mut broken_text = get_display_name_text(&e.render_name, &e.metadata, ctx);
+            if ctx.show_targets {
+                if let Some(target) = e.symlink_target.as_ref() {
+                    broken_text.push_str(" -> ");
+                    broken_text.push_str(&target.to_string_lossy());
+                }
             }
-            row.push_str(&highlight_broken_symlink_text(&broken_text));
+            row.push_str(&highlight_broken_symlink_text(
+                &broken_text,
+                ctx.color_enabled,
+            ));
         } else {
             row.push_str(&get_styled_name(
-                &e.display_name,
+                &e.render_name,
                 &e.actual_path,
                 &e.metadata,
                 ctx,
             ));
-            if let Some(target) = e.symlink_target.as_ref() {
-                row.push_str(" -> ");
-                row.push_str(&get_symlink_target_display(&e.actual_path, target, ctx));
+            if ctx.show_targets {
+                if let Some(target) = e.symlink_target.as_ref() {
+                    row.push_str(" -> ");
+                    row.push_str(&get_symlink_target_display(&e.actual_path, target, ctx));
+                }
             }
         }
         out.push_str(&row);
+        out.push('\n');
+    }
+
+    if ctx.header && ctx.reverse {
+        out.push_str(&header_row);
         out.push('\n');
     }
 
@@ -916,7 +1408,40 @@ fn get_styled_name(
 ) -> String {
     let name = get_display_name_text(display_name, metadata, ctx);
     if metadata.file_type().is_symlink() && fs::metadata(actual_path).is_err() {
-        return highlight_broken_symlink_text(&name);
+        return highlight_broken_symlink_text(&name, ctx.color_enabled);
+    }
+    if ctx.absolute {
+        let abs_path = normalize_path_lexical(&to_full_path(actual_path));
+        let abs_text = abs_path.to_string_lossy().into_owned();
+        let suffix = name.strip_prefix(abs_text.as_str()).unwrap_or("");
+        let (prefix, basename_core) = match abs_text.rfind('/') {
+            Some(idx) if idx + 1 < abs_text.len() => (&abs_text[..idx + 1], &abs_text[idx + 1..]),
+            _ => ("", abs_text.as_str()),
+        };
+        let basename = format!("{}{}", basename_core, suffix);
+        let styled_basename = paint_text_with_lscolors(&basename, actual_path, metadata, ctx);
+        let styled_prefix = if prefix.is_empty() {
+            String::new()
+        } else if !ctx.color_enabled {
+            prefix.to_string()
+        } else {
+            format!("\x1b[38;2;255;255;255m{}\x1b[0m", prefix)
+        };
+
+        if ctx.hyperlink {
+            let mut out = String::new();
+            if !styled_prefix.is_empty() {
+                let prefix_target = abs_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("/"));
+                out.push_str(&hyperlink_path(&prefix_target, &styled_prefix));
+            }
+            out.push_str(&hyperlink_path(&abs_path, &styled_basename));
+            return out;
+        }
+
+        return format!("{}{}", styled_prefix, styled_basename);
     }
     let painted = paint_text_with_lscolors(&name, actual_path, metadata, ctx);
     if ctx.hyperlink {
@@ -931,6 +1456,9 @@ fn paint_text_with_lscolors(
     metadata: &fs::Metadata,
     ctx: &Context,
 ) -> String {
+    if !ctx.color_enabled {
+        return text.to_string();
+    }
     match ctx
         .lscolors
         .style_for_path_with_metadata(path, Some(metadata))
@@ -947,22 +1475,39 @@ fn paint_text_with_lscolors(
     }
 }
 
+fn get_classify_suffix(metadata: &fs::Metadata) -> Option<char> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        Some('@')
+    } else if file_type.is_dir() {
+        Some('/')
+    } else if file_type.is_fifo() {
+        Some('|')
+    } else if file_type.is_socket() {
+        Some('=')
+    } else if metadata.permissions().mode() & 0o111 != 0 {
+        Some('*')
+    } else {
+        None
+    }
+}
+
 fn get_display_name_text(display_name: &str, metadata: &fs::Metadata, ctx: &Context) -> String {
     let mut name = display_name.to_string();
     if ctx.classify {
-        if metadata.file_type().is_symlink() {
-            name.push('@');
-        } else if metadata.is_dir() {
-            name.push('/');
-        } else if metadata.permissions().mode() & 0o111 != 0 {
-            name.push('*');
+        if let Some(suffix) = get_classify_suffix(metadata) {
+            name.push(suffix);
         }
     }
     name
 }
 
-fn highlight_broken_symlink_text(text: &str) -> String {
-    format!("\x1b[48;2;255;0;0m\x1b[38;2;255;255;255m{}\x1b[0m", text)
+fn highlight_broken_symlink_text(text: &str, color_enabled: bool) -> String {
+    if color_enabled {
+        format!("\x1b[48;2;255;0;0m\x1b[38;2;255;255;255m{}\x1b[0m", text)
+    } else {
+        text.to_string()
+    }
 }
 
 fn hyperlink_path(path: &Path, text: &str) -> String {
@@ -992,6 +1537,25 @@ fn to_full_path(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     }
+}
+
+fn normalize_path_lexical(path: &Path) -> PathBuf {
+    let is_absolute = path.is_absolute();
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !is_absolute {
+                    out.push("..");
+                }
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                out.push(component.as_os_str())
+            }
+        }
+    }
+    out
 }
 
 fn write_path_list(cache_path: &Path, paths: &[PathBuf]) -> io::Result<()> {
@@ -1051,14 +1615,27 @@ fn get_symlink_target_display(link_path: &Path, target: &Path, ctx: &Context) ->
     };
 
     let painted = if let Some(path) = resolved_target.as_deref() {
-        let target_is_dir = fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
-        if ctx.classify && target_is_dir && !display_text.ends_with('/') {
-            display_text.push('/');
+        let target_metadata = fs::symlink_metadata(path).ok();
+        if ctx.classify {
+            if let Some(m) = target_metadata.as_ref() {
+                if let Some(suffix) = get_classify_suffix(m) {
+                    if !display_text.ends_with(suffix) {
+                        display_text.push(suffix);
+                    }
+                }
+            }
         }
 
-        let (split_text, trailing_slash) = if display_text.ends_with('/') && display_text.len() > 1
-        {
-            (&display_text[..display_text.len() - 1], "/")
+        let (split_text, trailing_suffix) = if display_text.len() > 1 && ctx.classify {
+            let last_char = display_text.chars().last().unwrap();
+            if ['/', '*', '@', '|', '='].contains(&last_char) {
+                (
+                    &display_text[..display_text.len() - 1],
+                    &display_text[display_text.len() - 1..],
+                )
+            } else {
+                (display_text.as_str(), "")
+            }
         } else {
             (display_text.as_str(), "")
         };
@@ -1069,8 +1646,7 @@ fn get_symlink_target_display(link_path: &Path, target: &Path, ctx: &Context) ->
             }
             _ => ("", split_text),
         };
-        let basename_with_suffix = format!("{}{}", basename, trailing_slash);
-        let target_metadata = fs::symlink_metadata(path).ok();
+        let basename_with_suffix = format!("{}{}", basename, trailing_suffix);
         let target_style = ctx
             .lscolors
             .style_for_path_with_metadata(path, target_metadata.as_ref())
@@ -1078,7 +1654,7 @@ fn get_symlink_target_display(link_path: &Path, target: &Path, ctx: &Context) ->
         let styled_basename = match target_style {
             Some(style) => {
                 let ansi_style = Style::to_nu_ansi_term_style(style);
-                if ansi_style == nu_ansi_term::Style::default() {
+                if !ctx.color_enabled || ansi_style == nu_ansi_term::Style::default() {
                     basename_with_suffix
                 } else {
                     ansi_style.paint(basename_with_suffix).to_string()
@@ -1088,6 +1664,8 @@ fn get_symlink_target_display(link_path: &Path, target: &Path, ctx: &Context) ->
         };
         if prefix.is_empty() {
             styled_basename
+        } else if !ctx.color_enabled {
+            format!("{}{}", prefix, styled_basename)
         } else {
             format!("\x1b[38;2;255;255;255m{}\x1b[0m{}", prefix, styled_basename)
         }
@@ -1103,7 +1681,22 @@ fn get_symlink_target_display(link_path: &Path, target: &Path, ctx: &Context) ->
     painted
 }
 
-fn format_permissions(mode: u32) -> String {
+fn format_permissions(mode: u32, color_enabled: bool) -> String {
+    if !color_enabled {
+        let mut plain = String::new();
+        for mask in [
+            0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
+        ] {
+            let ch = match mask {
+                0o400 | 0o040 | 0o004 => 'r',
+                0o200 | 0o020 | 0o002 => 'w',
+                _ => 'x',
+            };
+            plain.push(if mode & mask != 0 { ch } else { '-' });
+        }
+        return plain;
+    }
+
     let p = [
         (0o400, "r", nu_ansi_term::Color::LightYellow.bold()),
         (0o200, "w", nu_ansi_term::Color::LightRed.bold()),
