@@ -218,6 +218,42 @@ fn push_unique_column(columns: &mut Vec<DetailColumn>, column: DetailColumn) {
     }
 }
 
+fn push_long_shorthand_columns(columns: &mut Vec<DetailColumn>) {
+    push_unique_column(columns, DetailColumn::Perms);
+    push_unique_column(columns, DetailColumn::SizeLogical);
+    push_unique_column(columns, DetailColumn::Owner);
+    push_unique_column(columns, DetailColumn::Time);
+}
+
+fn dot_entry_rank(name: &str) -> Option<u8> {
+    match name {
+        "." => Some(0),
+        ".." => Some(1),
+        _ => None,
+    }
+}
+
+fn pin_dot_entries_top(entries: &mut Vec<EntryInfo>) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut pinned: Vec<(u8, EntryInfo)> = Vec::new();
+    let mut rest: Vec<EntryInfo> = Vec::with_capacity(entries.len());
+
+    for entry in entries.drain(..) {
+        if let Some(rank) = dot_entry_rank(&entry.display_name) {
+            pinned.push((rank, entry));
+        } else {
+            rest.push(entry);
+        }
+    }
+
+    pinned.sort_by_key(|(rank, _)| *rank);
+    entries.extend(pinned.into_iter().map(|(_, entry)| entry));
+    entries.extend(rest);
+}
+
 fn parse_detail_column_preference() -> Vec<DetailColumn> {
     let mut columns = Vec::new();
     let mut stop_parsing_flags = false;
@@ -233,6 +269,7 @@ fn parse_detail_column_preference() -> Vec<DetailColumn> {
         }
         if let Some(long) = arg.strip_prefix("--") {
             match long {
+                "long" => push_long_shorthand_columns(&mut columns),
                 "permissions" => push_unique_column(&mut columns, DetailColumn::Perms),
                 "size" => push_unique_column(&mut columns, DetailColumn::SizeLogical),
                 "counts" => {
@@ -254,6 +291,7 @@ fn parse_detail_column_preference() -> Vec<DetailColumn> {
             }
             for ch in shorts.chars() {
                 match ch {
+                    'l' => push_long_shorthand_columns(&mut columns),
                     'p' => push_unique_column(&mut columns, DetailColumn::Perms),
                     's' => push_unique_column(&mut columns, DetailColumn::SizeLogical),
                     'c' => {
@@ -349,7 +387,7 @@ fn main() {
     };
     let mut entries = Vec::new();
     let need_counts = cli.counts || matches!(cli.sort, SortBy::DirCount | SortBy::FileCount);
-    let (recursive_sizes, recursive_counts) = collect_recursive_stats(
+    let (recursive_sizes, recursive_counts, root_true_size) = collect_recursive_stats(
         Path::new(&cli.path),
         show_hidden,
         cli.dedupe_hardlinks,
@@ -376,22 +414,24 @@ fn main() {
                 &mut group_cache,
             ));
         }
-        let parent_path = if cli.path == "." {
-            "..".to_string()
-        } else {
-            format!("{}/..", cli.path)
-        };
-        if let Ok(m) = fs::symlink_metadata(&parent_path) {
-            entries.push(create_entry_info(
-                "..",
-                PathBuf::from(&parent_path),
-                m,
-                &ctx,
-                &recursive_sizes,
-                &recursive_counts,
-                &mut user_cache,
-                &mut group_cache,
-            ));
+        if !cli.true_size {
+            let parent_path = if cli.path == "." {
+                "..".to_string()
+            } else {
+                format!("{}/..", cli.path)
+            };
+            if let Ok(m) = fs::symlink_metadata(&parent_path) {
+                entries.push(create_entry_info(
+                    "..",
+                    PathBuf::from(&parent_path),
+                    m,
+                    &ctx,
+                    &recursive_sizes,
+                    &recursive_counts,
+                    &mut user_cache,
+                    &mut group_cache,
+                ));
+            }
         }
     }
 
@@ -439,6 +479,16 @@ fn main() {
             &mut user_cache,
             &mut group_cache,
         ));
+    }
+
+    if cli.all && cli.true_size && input_is_dir {
+        let dot_true_size = root_true_size.unwrap_or_else(|| {
+            recursive_dir_on_disk_size(Path::new(&cli.path), show_hidden, cli.dedupe_hardlinks)
+        });
+        if let Some(dot_entry) = entries.iter_mut().find(|e| e.display_name == ".") {
+            dot_entry.true_size_str = format_size(dot_true_size);
+            dot_entry.final_size = dot_true_size;
+        }
     }
 
     if entries.is_empty() {
@@ -509,6 +559,9 @@ fn main() {
     if cli.reverse {
         entries.reverse();
     }
+    if cli.all && input_is_dir {
+        pin_dot_entries_top(&mut entries);
+    }
 
     if cli.git {
         let (show_git_status, show_repo_status) =
@@ -577,7 +630,7 @@ fn collect_output_paths(entries: &[EntryInfo]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut dir_paths = Vec::new();
     let mut file_paths = Vec::new();
     for entry in entries {
-        let full_path = to_full_path(&entry.actual_path);
+        let full_path = normalize_path_lexical(&to_full_path(&entry.actual_path));
         let is_dir = if entry.is_symlink {
             entry.is_target_dir
         } else {
@@ -851,9 +904,13 @@ fn collect_recursive_stats(
     dedupe_hardlinks: bool,
     need_sizes: bool,
     need_counts: bool,
-) -> (HashMap<OsString, u64>, HashMap<OsString, (u64, u64)>) {
+) -> (
+    HashMap<OsString, u64>,
+    HashMap<OsString, (u64, u64)>,
+    Option<u64>,
+) {
     if !need_sizes && !need_counts {
-        return (HashMap::new(), HashMap::new());
+        return (HashMap::new(), HashMap::new(), None);
     }
 
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
@@ -861,6 +918,15 @@ fn collect_recursive_stats(
     // Top-level keyed aggregation: key is immediate child directory name.
     let dir_local_stats = Arc::new(Mutex::new(HashMap::<OsString, (u64, u64, u64)>::new()));
     let shared_stats = Arc::clone(&dir_local_stats);
+    let root_size_total = if need_sizes {
+        let initial = fs::symlink_metadata(&canonical_base)
+            .map(|m| on_disk_size(&m))
+            .unwrap_or(0);
+        Some(Arc::new(Mutex::new(initial)))
+    } else {
+        None
+    };
+    let shared_root_size = root_size_total.as_ref().map(Arc::clone);
     let seen_inodes = if need_sizes && dedupe_hardlinks {
         Some(Arc::new(Mutex::new(HashSet::<(u64, u64)>::new())))
     } else {
@@ -885,18 +951,38 @@ fn collect_recursive_stats(
             let first_component = rel_components.next();
 
             let mut local_updates: HashMap<OsString, (u64, u64, u64)> = HashMap::new();
+            let mut callback_size = 0u64;
 
             // Root callback: seed top-level dir entries and add each top-level dir's own size.
             if first_component.is_none() {
+                let mut hardlink_candidates: Vec<(u64, u64, u64)> = Vec::new();
                 for child in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
-                    if !child.file_type().is_dir() {
+                    let ft = child.file_type();
+                    if !need_sizes {
                         continue;
                     }
-                    let key = child.file_name().to_os_string();
-                    let stats = local_updates.entry(key).or_insert((0, 0, 0));
-                    if need_sizes {
-                        if let Ok(metadata) = child.metadata() {
-                            stats.0 += on_disk_size(&metadata);
+                    if let Ok(metadata) = child.metadata() {
+                        let size = on_disk_size(&metadata);
+                        if ft.is_dir() {
+                            callback_size += size;
+                            let key = child.file_name().to_os_string();
+                            let stats = local_updates.entry(key).or_insert((0, 0, 0));
+                            stats.0 += size;
+                        } else if shared_seen.is_none() || metadata.nlink() <= 1 {
+                            callback_size += size;
+                        } else {
+                            hardlink_candidates.push((metadata.dev(), metadata.ino(), size));
+                        }
+                    }
+                }
+                if let Some(ref seen) = shared_seen {
+                    if !hardlink_candidates.is_empty() {
+                        if let Ok(mut set) = seen.lock() {
+                            for (dev, ino, size) in hardlink_candidates {
+                                if set.insert((dev, ino)) {
+                                    callback_size += size;
+                                }
+                            }
                         }
                     }
                 }
@@ -948,7 +1034,16 @@ fn collect_recursive_stats(
                     }
                 }
 
+                callback_size = local_size;
                 local_updates.insert(top_level_name, (local_size, local_dirs, local_files));
+            }
+
+            if let Some(ref root_size) = shared_root_size {
+                if callback_size > 0 {
+                    if let Ok(mut total) = root_size.lock() {
+                        *total += callback_size;
+                    }
+                }
             }
 
             if let Ok(mut stats) = shared_stats.lock() {
@@ -980,7 +1075,16 @@ fn collect_recursive_stats(
         }
     }
 
-    (recursive_sizes, recursive_counts)
+    let root_recursive_size = if need_sizes {
+        root_size_total.map(|shared| match Arc::try_unwrap(shared) {
+            Ok(mutex) => mutex.into_inner().unwrap_or(0),
+            Err(shared_again) => shared_again.lock().map(|v| *v).unwrap_or(0),
+        })
+    } else {
+        None
+    };
+
+    (recursive_sizes, recursive_counts, root_recursive_size)
 }
 
 fn recursive_dir_on_disk_size(base_path: &Path, show_hidden: bool, dedupe_hardlinks: bool) -> u64 {

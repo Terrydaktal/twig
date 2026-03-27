@@ -65,18 +65,20 @@ Default path is `.`.
 From `twig --help`:
 
 - `-a, --all` list all files, including hidden
+  - with `-S`, `.` is shown but `..` is omitted
 - `-A, --almost-all` list hidden but exclude `.` and `..`
 - `-l, --long` shorthand for `-Lptos --show-targets`
 - `-L, --list` force one-entry-per-line list mode
 - `-p, --permissions` show permission bits
 - `-s, --size` show logical file size and allocated dir size
+- `-c, --counts` show recursive dir/file counts for directory entries
 - `-o, --owner` show file owner
 - `-g, --group` show group
 - `-t, --modified` show mtime
 - `-F, --classify` append classifier (`/`, `@`, `*`, etc.)
-- `--sort <name|type|date|size>` sort key (default `type`)
+- `--sort <name|type|date|size|dircount|filecount>` sort key (default `type`)
 - `-r, --reverse` reverse listing order
-- `--hyperlink` render names as OSC8 hyperlinks
+- `-U, --hyperlink` render names as OSC8 hyperlinks
 - `-x, --show-targets` show symlink target paths
 - `--git` smart Git columns:
   - file staged/unstaged status when listing path is in a Git repo
@@ -84,6 +86,8 @@ From `twig --help`:
 - `-d, --dereference` use symlink target size/time fields for `-s`/`-S`/`-t`
 - `-S, --true-size` show allocated file size + recursive allocated dir size
 - `-H, --no-dedupe-hardlinks` disable hardlink dedupe for `-S`
+- `--header` show list headers (moved to bottom with `-r`)
+- `--color <always|never>` control ANSI color rendering
 - `--cache-raw` write listed full paths for dirs/files to `/tmp/fzf-history-$USER/...`
 
 ## Operation Pipeline (Execution Order)
@@ -91,7 +95,7 @@ From `twig --help`:
 For each invocation, `twig` runs roughly this pipeline:
 
 1. Parse CLI flags and build rendering context.
-2. Optionally precompute recursive true-size totals (only for `-S`).
+2. Optionally precompute recursive true-size totals (only for `-S`), including root total for `.` in `-a -S`, in one traversal.
 3. Scan one directory level using `jwalk` (`max_depth(1)`).
 4. Build per-entry metadata struct:
    - file type
@@ -121,6 +125,7 @@ For each invocation, `twig` runs roughly this pipeline:
 - `-S` / `--true-size`
   - Files: allocated blocks (`st_blocks * 512`)
   - Dirs: recursive allocated total (directory + descendants)
+  - In `-a -S`, injected `.` shows the listing directory's full recursive total
   - With `-d` on symlink entries:
     - symlink -> file: allocated blocks of target file
     - symlink -> dir: recursive allocated total of target directory
@@ -198,6 +203,7 @@ Shown only for directory entries that are Git roots:
 ## Raw Cache Output (`--cache-raw`)
 
 When enabled, `twig` writes full absolute paths of displayed entries to:
+- Paths are lexically normalized (for example, `/home/user/./file` is written as `/home/user/file`)
 
 - Dirs:
   - `/tmp/fzf-history-$USER/universal-last-dirs-<fish_pid>`
@@ -213,7 +219,7 @@ PID suffix resolution order:
 
 - Compact mode (default): names separated by two spaces, single row
 - Detailed mode: one row per entry when any of:
-  - `-L`, `-p`, `-s`, `-o`, `-g`, `-t`, `-l`, `--git`, `-S`
+  - `-L`, `-p`, `-s`, `-c`, `-o`, `-g`, `-t`, `-l`, `--git`, `-S`, `--header`
 
 Detailed row columns are assembled left-to-right as enabled:
 1. permissions
@@ -231,7 +237,7 @@ Detailed row columns are assembled left-to-right as enabled:
 # Fast type-sorted top-level list
 ./target/release/twig
 
-# Long view equivalent to -psot
+# Long view equivalent to -Lptos --show-targets
 ./target/release/twig -l ~/Dev
 
 # Include hidden files and classify entries
