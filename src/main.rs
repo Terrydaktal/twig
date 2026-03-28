@@ -312,6 +312,35 @@ fn parse_detail_column_preference() -> Vec<DetailColumn> {
     columns
 }
 
+fn sort_was_explicitly_set() -> bool {
+    let mut stop_parsing_flags = false;
+    let mut expect_sort_value = false;
+
+    for arg in std::env::args_os().skip(1) {
+        let arg = arg.to_string_lossy();
+
+        if expect_sort_value {
+            return true;
+        }
+        if stop_parsing_flags {
+            continue;
+        }
+        if arg == "--" {
+            stop_parsing_flags = true;
+            continue;
+        }
+        if arg == "--sort" {
+            expect_sort_value = true;
+            continue;
+        }
+        if arg.starts_with("--sort=") {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn is_detail_column_enabled(column: DetailColumn, ctx: &Context) -> bool {
     match column {
         DetailColumn::Perms => ctx.show_perms,
@@ -352,6 +381,7 @@ fn build_detail_columns(ctx: &Context) -> Vec<DetailColumn> {
 
 fn main() {
     let cli = Cli::parse();
+    let sort_explicit = sort_was_explicitly_set();
     let show_hidden = cli.all || cli.almost_all;
 
     let piped_output = !io::stdout().is_terminal();
@@ -559,7 +589,7 @@ fn main() {
     if cli.reverse {
         entries.reverse();
     }
-    if cli.all && input_is_dir {
+    if cli.all && input_is_dir && !sort_explicit {
         pin_dot_entries_top(&mut entries);
     }
 

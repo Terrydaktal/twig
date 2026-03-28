@@ -66,6 +66,7 @@ From `twig --help`:
 
 - `-a, --all` list all files, including hidden
   - with `-S`, `.` is shown but `..` is omitted
+  - with implicit/default sort, injected dot entries are pinned to top; with explicit `--sort`, they are sorted normally
 - `-A, --almost-all` list hidden but exclude `.` and `..`
 - `-l, --long` shorthand for `-Lptos --show-targets`
 - `-L, --list` force one-entry-per-line list mode
