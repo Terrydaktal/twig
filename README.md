@@ -1,16 +1,25 @@
 # twig
 
-A fast `eza`-style directory lister focused on high-throughput top-level listing, strong symlink handling, Git-aware columns, and predictable size semantics.
-
-## What This Project Is
-
 `twig` is a single-binary Rust CLI that lists one directory level (`max_depth = 1`) with optional long-format metadata, sorting, Git integration, symlink target rendering, hyperlink support, and path caching for shell tooling.
 
-Primary goals:
-- Fast listing in large directories
-- Good defaults (`--sort type`)
-- Fine-grained output control
-- Better symlink and Git visibility in long mode
+## Justification
+
+1. When piping or when there are >1000 entries in the listing, `--color=auto` and `--hyperlink=auto` flags do not apply colour or hyperlinks, and instead use a fast mode.  
+   - Benchmarking with hyperlinks and colours disabled on all `twig` is **2–3× faster** than `/bin/ls` (with `twig -la` same speed as `/bin/ls -la`) and **8–12× faster** than `eza` (with `twig -la` **1.5× faster** than `eza -la`).  
+   - With hyperlinks and colour forced on both, `twig` is **4× faster** than `eza` with hyperlinks and colour (with `twig -la` **2.2× faster** than `eza -la`).
+2. `twig -S` is **5–6× faster** than `eza --total-size` and around **2.3× faster** than `dust -d 1` on large directories with many recursive files (e.g., `~`).
+3. `--cache-raw` writes full directory/file path lists to `/tmp/fzf-history-$USER/universal-last-{dirs,files}-<fish_pid>`, allowing quick access to listed files with a fuzzy picker.
+4. `-c`, `--counts` – recursive directory/file count columns. Supports `--sort dircount` and `--sort filecount`.
+5. `eza` `--git-repos` and `--git` are combined into a smart `--git` flag that shows either or both columns when relevant
+6. In `-X` / `--absolute`, `twig` splits the prefix and basename into separate hyperlinks, with the prefix styled in white.
+7. `-x`, `--show-targets` – explicit flag to display symlink targets (usable outside long mode).
+8. Symlink targets are rendered/styled separately and can be hyperlinked independently. The hyperlink is also split; the prefix is coloured white and styled separately from the `LS_COLORS` scheme.
+9. Column order follows flag order from `argv`, including compact short bundles. `-l` is expanded into ordered `p,s,o,t` at parse time, so later flags append after it.
+10. `--header` moves to the bottom when `-r` (reverse) is used.
+11. `-L` – one file per line view. `twig` force‑enables list mode when piped, when `--header` is used, or when any detail columns are active.
+12. `-a -S` shows `.` (not `..`) and gives `.` full recursive true size.
+13. `-s` in `twig` shows logical size of files and allocated blocks for directories and `-S` shows allocated block size of files and true recursive sizes of directories.
+14. `-H`, `--no-dedupe-hardlinks` – toggle for `-S` hardlink deduplication.
 
 ## Project Structure
 
@@ -80,7 +89,7 @@ From `twig --help`:
 - `-F, --classify` append classifier (`/`, `@`, `*`, etc.)
 - `--sort <name|type|date|size|dircount|filecount>` sort key (default `type`)
 - `-r, --reverse` reverse listing order
-- `-U, --hyperlink` render names as OSC8 hyperlinks
+- `-U, --hyperlink[=<always|auto|never>]` render names as OSC8 hyperlinks
 - `-x, --show-targets` show symlink target paths
 - `--git` smart Git columns:
   - file staged/unstaged status when listing path is in a Git repo
@@ -89,7 +98,7 @@ From `twig --help`:
 - `-S, --true-size` show allocated file size + recursive allocated dir size
 - `-H, --no-dedupe-hardlinks` disable hardlink dedupe for `-S`
 - `--header` show list headers (moved to bottom with `-r`)
-- `--color <always|never>` control ANSI color rendering
+- `--color <always|auto|never>` control ANSI color rendering
 - `--cache-raw` write listed full paths for dirs/files to `/tmp/fzf-history-$USER/...`
 
 ## Operation Pipeline (Execution Order)
@@ -104,7 +113,10 @@ For each invocation, `twig` runs roughly this pipeline:
    - symlink target/broken state
    - size string + numeric sort size
    - owner/group/time strings
-5. If `--hyperlink` is set and shown file count exceeds `1000`, hyperlinks are silently disabled.
+5. Resolve `--color` and `--hyperlink` modes:
+   - `always`: always enabled
+   - `never`: always disabled
+   - `auto`: enabled only on TTY and only when shown entry count is `<= 1000`
 6. Sort entries by selected key, apply reverse if requested.
 7. Optionally populate Git columns:
    - file status pair when listing path is inside a Git repo
@@ -198,9 +210,12 @@ Shown only for directory entries that are Git roots:
 - Directory type marker `d` in permissions now uses the same directory style as name rendering.
 - Symlink targets also resolve color via `LS_COLORS` where metadata is available.
 
-## Hyperlink Guardrail
+## Color/Hyperlink Auto Guardrail
 
-`--hyperlink` is automatically disabled (silently) when output would include more than `1000` non-directory entries. This avoids high ANSI/OSC8 overhead on large hot paths.
+For `--color=auto` and `--hyperlink=auto` (including plain `-U`):
+- output is disabled when stdout is not a TTY
+- output is disabled when shown entry count is greater than `1000` (files or dirs)
+- `always` bypasses these guards
 
 ## Raw Cache Output (`--cache-raw`)
 

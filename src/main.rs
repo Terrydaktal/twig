@@ -18,7 +18,7 @@ use users::{get_group_by_gid, get_user_by_uid};
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-const HYPERLINK_MAX_FILES: usize = 1000;
+const AUTO_STYLE_MAX_ENTRIES: usize = 1000;
 
 #[derive(ValueEnum, Clone, Debug, Copy, PartialEq)]
 enum SortBy {
@@ -33,8 +33,9 @@ enum SortBy {
 }
 
 #[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
-enum ColorMode {
+enum OutputWhen {
     Always,
+    Auto,
     Never,
 }
 
@@ -115,12 +116,20 @@ struct Cli {
     reverse: bool,
 
     /// Control colorized output
-    #[arg(long, value_enum, default_value = "always")]
-    color: ColorMode,
+    #[arg(long, value_enum, default_value = "auto")]
+    color: OutputWhen,
 
     /// Render names as terminal hyperlinks
-    #[arg(short = 'U', long)]
-    hyperlink: bool,
+    #[arg(
+        short = 'U',
+        long,
+        value_enum,
+        default_value = "never",
+        default_missing_value = "auto",
+        num_args = 0..=1,
+        require_equals = true
+    )]
+    hyperlink: OutputWhen,
 
     /// Show symlink targets
     #[arg(short = 'x', long = "show-targets")]
@@ -383,15 +392,604 @@ fn build_detail_columns(ctx: &Context) -> Vec<DetailColumn> {
     columns
 }
 
+struct FastEntry {
+    display_name: String,
+    actual_path: PathBuf,
+    is_hidden: bool,
+    is_dir: bool,
+    is_symlink: bool,
+    is_target_dir: bool,
+}
+
+struct LongFastEntry {
+    display_name: String,
+    actual_path: PathBuf,
+    metadata: fs::Metadata,
+    is_hidden: bool,
+    is_dir: bool,
+    is_symlink: bool,
+    is_target_dir: bool,
+    logical_size: u64,
+    logical_size_str: String,
+    user_str: String,
+    time_str: String,
+    sort_mtime: i64,
+    symlink_target: Option<PathBuf>,
+    broken_symlink: bool,
+}
+
+fn can_use_large_dir_fast_path(cli: &Cli, input_is_dir: bool) -> bool {
+    input_is_dir
+        && !cli.directory
+        && !cli.long
+        && !cli.list
+        && !cli.header
+        && !cli.permissions
+        && !cli.size
+        && !cli.counts
+        && !cli.owner
+        && !cli.group
+        && !cli.modified
+        && !cli.classify
+        && !cli.show_targets
+        && !cli.absolute
+        && !cli.dereference
+        && !cli.git
+        && !cli.true_size
+        && matches!(cli.sort, SortBy::Name | SortBy::Type)
+}
+
+fn can_use_large_dir_long_fast_path(cli: &Cli, input_is_dir: bool) -> bool {
+    input_is_dir
+        && !cli.directory
+        && cli.long
+        && !cli.list
+        && !cli.permissions
+        && !cli.size
+        && !cli.counts
+        && !cli.owner
+        && !cli.group
+        && !cli.modified
+        && !cli.classify
+        && !cli.show_targets
+        && !cli.absolute
+        && !cli.dereference
+        && !cli.git
+        && !cli.true_size
+        && !cli.header
+}
+
+fn fast_type_rank(e: &FastEntry) -> u8 {
+    if e.is_symlink && e.is_target_dir {
+        0
+    } else if e.is_dir {
+        1
+    } else if e.is_symlink {
+        2
+    } else {
+        3
+    }
+}
+
+fn collect_fast_entries(base_path: &Path, show_hidden: bool) -> io::Result<Vec<FastEntry>> {
+    let mut entries = Vec::new();
+    for item in fs::read_dir(base_path)? {
+        let Ok(dir_entry) = item else {
+            continue;
+        };
+        let file_name = dir_entry.file_name().to_string_lossy().to_string();
+        let is_hidden = file_name.starts_with('.');
+        if is_hidden && !show_hidden {
+            continue;
+        }
+
+        let actual_path = dir_entry.path();
+        let ft = match dir_entry
+            .file_type()
+            .or_else(|_| fs::symlink_metadata(&actual_path).map(|m| m.file_type()))
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let is_symlink = ft.is_symlink();
+        let is_dir = ft.is_dir();
+        let is_target_dir = if is_symlink {
+            fs::metadata(&actual_path)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+        } else {
+            is_dir
+        };
+        entries.push(FastEntry {
+            display_name: file_name,
+            actual_path,
+            is_hidden,
+            is_dir,
+            is_symlink,
+            is_target_dir,
+        });
+    }
+    Ok(entries)
+}
+
+fn pin_dot_entries_top_fast(entries: &mut Vec<FastEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut pinned: Vec<(u8, FastEntry)> = Vec::new();
+    let mut rest: Vec<FastEntry> = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        if let Some(rank) = dot_entry_rank(&entry.display_name) {
+            pinned.push((rank, entry));
+        } else {
+            rest.push(entry);
+        }
+    }
+    pinned.sort_by_key(|(rank, _)| *rank);
+    entries.extend(pinned.into_iter().map(|(_, entry)| entry));
+    entries.extend(rest);
+}
+
+fn paint_name_fast(name: &str, path: &Path, ctx: &Context) -> String {
+    if !ctx.color_enabled {
+        return name.to_string();
+    }
+    match ctx.lscolors.style_for_path(path) {
+        Some(style) => {
+            let ansi_style = Style::to_nu_ansi_term_style(style);
+            if ansi_style == nu_ansi_term::Style::default() {
+                name.to_string()
+            } else {
+                ansi_style.paint(name).to_string()
+            }
+        }
+        None => name.to_string(),
+    }
+}
+
+fn try_render_large_dir_fast_path(
+    cli: &Cli,
+    ctx: &mut Context,
+    input_is_dir: bool,
+    sort_explicit: bool,
+    show_hidden: bool,
+    piped_output: bool,
+    cache_raw_enabled: bool,
+) -> Option<String> {
+    if !can_use_large_dir_fast_path(cli, input_is_dir) {
+        return None;
+    }
+
+    let mut entries = collect_fast_entries(Path::new(&cli.path), show_hidden).ok()?;
+
+    if cli.all {
+        entries.push(FastEntry {
+            display_name: ".".to_string(),
+            actual_path: PathBuf::from(&cli.path),
+            is_hidden: false,
+            is_dir: true,
+            is_symlink: false,
+            is_target_dir: true,
+        });
+        let parent_path = if cli.path == "." {
+            PathBuf::from("..")
+        } else {
+            PathBuf::from(format!("{}/..", cli.path))
+        };
+        entries.push(FastEntry {
+            display_name: "..".to_string(),
+            actual_path: parent_path,
+            is_hidden: false,
+            is_dir: true,
+            is_symlink: false,
+            is_target_dir: true,
+        });
+    }
+
+    if entries.len() <= AUTO_STYLE_MAX_ENTRIES {
+        return None;
+    }
+
+    let over_auto_limit = true;
+    ctx.color_enabled = output_enabled(cli.color, piped_output, over_auto_limit);
+    ctx.hyperlink = output_enabled(cli.hyperlink, piped_output, over_auto_limit);
+
+    entries.sort_by(|a, b| {
+        match cli.sort {
+            SortBy::Type => {
+                let a_rank = fast_type_rank(a);
+                let b_rank = fast_type_rank(b);
+                if a_rank != b_rank {
+                    return a_rank.cmp(&b_rank);
+                }
+            }
+            SortBy::Name => {}
+            _ => {}
+        }
+        if a.is_hidden != b.is_hidden {
+            return b.is_hidden.cmp(&a.is_hidden);
+        }
+        a.display_name.cmp(&b.display_name)
+    });
+    if cli.reverse {
+        entries.reverse();
+    }
+    if cli.all && !sort_explicit {
+        pin_dot_entries_top_fast(&mut entries);
+    }
+
+    if cache_raw_enabled {
+        let mut dir_paths = Vec::new();
+        let mut file_paths = Vec::new();
+        for e in &entries {
+            let full_path = normalize_path_lexical(&to_full_path(&e.actual_path));
+            let is_dir = if e.is_symlink { e.is_target_dir } else { e.is_dir };
+            if is_dir {
+                dir_paths.push(full_path);
+            } else {
+                file_paths.push(full_path);
+            }
+        }
+        if let Err(err) = write_cache_raw_paths(&dir_paths, &file_paths) {
+            eprintln!("failed to write --cache-raw files: {}", err);
+        }
+    }
+
+    let mut out = String::new();
+    for entry in &entries {
+        let painted = paint_name_fast(&entry.display_name, &entry.actual_path, ctx);
+        if ctx.hyperlink {
+            out.push_str(&hyperlink_path(&entry.actual_path, &painted));
+        } else {
+            out.push_str(&painted);
+        }
+        out.push_str("  ");
+    }
+    out.push('\n');
+    Some(out)
+}
+
+fn long_fast_type_rank(e: &LongFastEntry) -> u8 {
+    if e.is_symlink && e.is_target_dir {
+        0
+    } else if e.is_dir {
+        1
+    } else if e.is_symlink {
+        2
+    } else {
+        3
+    }
+}
+
+fn format_time_display(mtime: i64, now_year: i32, now_timestamp: i64) -> String {
+    let dt: DateTime<Local> = DateTime::from_timestamp(mtime, 0)
+        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
+        .with_timezone(&Local);
+    if now_year == dt.year() && (now_timestamp - dt.timestamp()).abs() < 15552000 {
+        dt.format("%e %b %H:%M").to_string()
+    } else {
+        dt.format("%e %b  %Y").to_string()
+    }
+}
+
+fn make_long_fast_entry(
+    display_name: String,
+    actual_path: PathBuf,
+    metadata: fs::Metadata,
+    now_year: i32,
+    now_timestamp: i64,
+    user_cache: &mut HashMap<u32, String>,
+) -> LongFastEntry {
+    let is_symlink = metadata.file_type().is_symlink();
+    let is_dir = metadata.is_dir();
+    let is_hidden = display_name.starts_with('.') && display_name != "." && display_name != "..";
+    let mut symlink_target = None;
+    let mut is_target_dir = false;
+    let mut broken_symlink = false;
+    if is_symlink {
+        symlink_target = fs::read_link(&actual_path).ok();
+        let target_meta = fs::metadata(&actual_path).ok();
+        is_target_dir = target_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        broken_symlink = target_meta.is_none();
+    }
+    let logical_size = if is_dir {
+        on_disk_size(&metadata)
+    } else {
+        metadata.len()
+    };
+    let logical_size_str = format_size(logical_size);
+    let uid = metadata.uid();
+    let user_str = user_cache
+        .entry(uid)
+        .or_insert_with(|| {
+            get_user_by_uid(uid)
+                .map(|u| u.name().to_string_lossy().into_owned())
+                .unwrap_or_else(|| uid.to_string())
+        })
+        .clone();
+    let sort_mtime = metadata.mtime();
+    let time_str = format_time_display(sort_mtime, now_year, now_timestamp);
+
+    LongFastEntry {
+        display_name,
+        actual_path,
+        metadata,
+        is_hidden,
+        is_dir,
+        is_symlink,
+        is_target_dir,
+        logical_size,
+        logical_size_str,
+        user_str,
+        time_str,
+        sort_mtime,
+        symlink_target,
+        broken_symlink,
+    }
+}
+
+fn collect_long_fast_entries(
+    base_path: &Path,
+    show_hidden: bool,
+    now_year: i32,
+    now_timestamp: i64,
+    user_cache: &mut HashMap<u32, String>,
+) -> io::Result<Vec<LongFastEntry>> {
+    let mut entries = Vec::new();
+    for item in fs::read_dir(base_path)? {
+        let Ok(dir_entry) = item else {
+            continue;
+        };
+        let file_name = dir_entry.file_name().to_string_lossy().to_string();
+        let is_hidden = file_name.starts_with('.');
+        if is_hidden && !show_hidden {
+            continue;
+        }
+        let actual_path = dir_entry.path();
+        let metadata = match fs::symlink_metadata(&actual_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        entries.push(make_long_fast_entry(
+            file_name,
+            actual_path,
+            metadata,
+            now_year,
+            now_timestamp,
+            user_cache,
+        ));
+    }
+    Ok(entries)
+}
+
+fn pin_dot_entries_top_long_fast(entries: &mut Vec<LongFastEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut pinned: Vec<(u8, LongFastEntry)> = Vec::new();
+    let mut rest: Vec<LongFastEntry> = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        if let Some(rank) = dot_entry_rank(&entry.display_name) {
+            pinned.push((rank, entry));
+        } else {
+            rest.push(entry);
+        }
+    }
+    pinned.sort_by_key(|(rank, _)| *rank);
+    entries.extend(pinned.into_iter().map(|(_, entry)| entry));
+    entries.extend(rest);
+}
+
+fn try_render_large_dir_long_fast_path(
+    cli: &Cli,
+    ctx: &mut Context,
+    input_is_dir: bool,
+    sort_explicit: bool,
+    show_hidden: bool,
+    piped_output: bool,
+    cache_raw_enabled: bool,
+) -> Option<String> {
+    if !can_use_large_dir_long_fast_path(cli, input_is_dir) {
+        return None;
+    }
+
+    let now = Local::now();
+    let now_year = now.year();
+    let now_timestamp = now.timestamp();
+    let mut user_cache = HashMap::<u32, String>::new();
+    let mut entries = collect_long_fast_entries(
+        Path::new(&cli.path),
+        show_hidden,
+        now_year,
+        now_timestamp,
+        &mut user_cache,
+    )
+    .ok()?;
+
+    if cli.all {
+        if let Ok(meta) = fs::symlink_metadata(&cli.path) {
+            entries.push(make_long_fast_entry(
+                ".".to_string(),
+                PathBuf::from(&cli.path),
+                meta,
+                now_year,
+                now_timestamp,
+                &mut user_cache,
+            ));
+        }
+        let parent_path = if cli.path == "." {
+            "..".to_string()
+        } else {
+            format!("{}/..", cli.path)
+        };
+        if let Ok(meta) = fs::symlink_metadata(&parent_path) {
+            entries.push(make_long_fast_entry(
+                "..".to_string(),
+                PathBuf::from(parent_path),
+                meta,
+                now_year,
+                now_timestamp,
+                &mut user_cache,
+            ));
+        }
+    }
+
+    if entries.len() <= AUTO_STYLE_MAX_ENTRIES {
+        return None;
+    }
+
+    let over_auto_limit = true;
+    ctx.color_enabled = output_enabled(cli.color, piped_output, over_auto_limit);
+    ctx.hyperlink = output_enabled(cli.hyperlink, piped_output, over_auto_limit);
+
+    entries.sort_by(|a, b| {
+        match cli.sort {
+            SortBy::Size => {
+                if a.logical_size != b.logical_size {
+                    return b.logical_size.cmp(&a.logical_size);
+                }
+                let a_name = a.display_name.trim_start_matches('.').to_lowercase();
+                let b_name = b.display_name.trim_start_matches('.').to_lowercase();
+                return a_name.cmp(&b_name);
+            }
+            SortBy::Date => {
+                if a.sort_mtime != b.sort_mtime {
+                    return b.sort_mtime.cmp(&a.sort_mtime);
+                }
+            }
+            SortBy::Type => {
+                let a_rank = long_fast_type_rank(a);
+                let b_rank = long_fast_type_rank(b);
+                if a_rank != b_rank {
+                    return a_rank.cmp(&b_rank);
+                }
+            }
+            SortBy::Name => {}
+            _ => {}
+        }
+        if a.is_hidden != b.is_hidden {
+            return b.is_hidden.cmp(&a.is_hidden);
+        }
+        a.display_name.cmp(&b.display_name)
+    });
+    if cli.reverse {
+        entries.reverse();
+    }
+    if cli.all && !sort_explicit {
+        pin_dot_entries_top_long_fast(&mut entries);
+    }
+
+    if cache_raw_enabled {
+        let mut dir_paths = Vec::new();
+        let mut file_paths = Vec::new();
+        for e in &entries {
+            let full_path = normalize_path_lexical(&to_full_path(&e.actual_path));
+            let is_dir = if e.is_symlink { e.is_target_dir } else { e.is_dir };
+            if is_dir {
+                dir_paths.push(full_path);
+            } else {
+                file_paths.push(full_path);
+            }
+        }
+        if let Err(err) = write_cache_raw_paths(&dir_paths, &file_paths) {
+            eprintln!("failed to write --cache-raw files: {}", err);
+        }
+    }
+
+    let mut max_size = 0usize;
+    let mut max_user = 0usize;
+    let mut max_time = 0usize;
+    for e in &entries {
+        max_size = max_size.max(e.logical_size_str.len());
+        max_user = max_user.max(e.user_str.len());
+        max_time = max_time.max(e.time_str.len());
+    }
+
+    let mut out = String::new();
+    for e in &entries {
+        let ft = if e.is_dir {
+            paint_text_with_lscolors("d", &e.actual_path, &e.metadata, ctx)
+        } else if e.is_symlink {
+            paint_if_enabled(
+                nu_ansi_term::Color::LightCyan.bold(),
+                "l",
+                ctx.color_enabled,
+            )
+        } else {
+            paint_if_enabled(nu_ansi_term::Color::White.bold(), "-", ctx.color_enabled)
+        };
+        out.push_str(&ft);
+        out.push_str(&format_permissions(e.metadata.permissions().mode(), ctx.color_enabled));
+        out.push(' ');
+
+        let size_text = format!("{:>width$}", e.logical_size_str, width = max_size);
+        out.push_str(&paint_if_enabled(
+            nu_ansi_term::Color::LightCyan.bold(),
+            &size_text,
+            ctx.color_enabled,
+        ));
+        out.push(' ');
+
+        out.push_str(&format!("{:<width$}", e.user_str, width = max_user));
+        out.push(' ');
+
+        let time_text = format!("{:<width$}", e.time_str, width = max_time);
+        out.push_str(&paint_if_enabled(
+            nu_ansi_term::Style::default().dimmed(),
+            &time_text,
+            ctx.color_enabled,
+        ));
+        out.push(' ');
+
+        if e.is_symlink && e.broken_symlink {
+            let mut broken_text = e.display_name.clone();
+            if ctx.show_targets {
+                if let Some(target) = e.symlink_target.as_ref() {
+                    broken_text.push_str(" -> ");
+                    broken_text.push_str(&target.to_string_lossy());
+                }
+            }
+            out.push_str(&highlight_broken_symlink_text(&broken_text, ctx.color_enabled));
+        } else {
+            let painted_name = paint_text_with_lscolors(&e.display_name, &e.actual_path, &e.metadata, ctx);
+            if ctx.hyperlink {
+                out.push_str(&hyperlink_path(&e.actual_path, &painted_name));
+            } else {
+                out.push_str(&painted_name);
+            }
+            if ctx.show_targets {
+                if let Some(target) = e.symlink_target.as_ref() {
+                    out.push_str(" -> ");
+                    out.push_str(&get_symlink_target_display(&e.actual_path, target, ctx));
+                }
+            }
+        }
+
+        out.push('\n');
+    }
+
+    Some(out)
+}
+
+fn output_enabled(mode: OutputWhen, piped_output: bool, over_auto_limit: bool) -> bool {
+    match mode {
+        OutputWhen::Always => true,
+        OutputWhen::Auto => !piped_output && !over_auto_limit,
+        OutputWhen::Never => false,
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let sort_explicit = sort_was_explicitly_set();
     let show_hidden = cli.all || cli.almost_all;
 
     let piped_output = !io::stdout().is_terminal();
-    let color_enabled = matches!(cli.color, ColorMode::Always) && !piped_output;
+    let color_enabled = output_enabled(cli.color, piped_output, false);
     let classify_enabled = cli.classify && !piped_output;
-    let hyperlink_enabled = cli.hyperlink && !piped_output;
+    let hyperlink_enabled = output_enabled(cli.hyperlink, piped_output, false);
     let cache_raw_enabled = cli.cache_raw && !piped_output;
     let lscolors = LsColors::from_env().unwrap_or_default();
 
@@ -428,12 +1026,43 @@ fn main() {
         cli.true_size,
         need_counts,
     );
+    let now = Local::now();
+    let now_year = now.year();
+    let now_timestamp = now.timestamp();
     let mut user_cache: HashMap<u32, String> = HashMap::new();
     let mut group_cache: HashMap<u32, String> = HashMap::new();
 
     let input_path = Path::new(&cli.path);
     let input_meta = fs::symlink_metadata(input_path).ok();
     let input_is_dir = input_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+
+    if let Some(output) = try_render_large_dir_long_fast_path(
+        &cli,
+        &mut ctx,
+        input_is_dir,
+        sort_explicit,
+        show_hidden,
+        piped_output,
+        cache_raw_enabled,
+    ) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(output.as_bytes());
+        return;
+    }
+
+    if let Some(output) = try_render_large_dir_fast_path(
+        &cli,
+        &mut ctx,
+        input_is_dir,
+        sort_explicit,
+        show_hidden,
+        piped_output,
+        cache_raw_enabled,
+    ) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(output.as_bytes());
+        return;
+    }
 
     if cli.all && input_is_dir && !cli.directory {
         if let Ok(m) = fs::symlink_metadata(&cli.path) {
@@ -446,6 +1075,8 @@ fn main() {
                 &recursive_counts,
                 &mut user_cache,
                 &mut group_cache,
+                now_year,
+                now_timestamp,
             ));
         }
         if !cli.true_size {
@@ -464,38 +1095,45 @@ fn main() {
                     &recursive_counts,
                     &mut user_cache,
                     &mut group_cache,
+                    now_year,
+                    now_timestamp,
                 ));
             }
         }
     }
 
     if input_is_dir && !cli.directory {
-        let walk_dir = WalkDir::new(&cli.path)
-            .max_depth(1)
-            .skip_hidden(!show_hidden);
+        let read_dir = match fs::read_dir(&cli.path) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
-        for entry in walk_dir {
-            let entry = match entry {
+        for dir_entry in read_dir {
+            let dir_entry = match dir_entry {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if entry.depth == 0 {
+            let file_name = dir_entry.file_name().to_string_lossy().to_string();
+            let is_hidden = file_name.starts_with('.');
+            if is_hidden && !show_hidden {
                 continue;
             }
-            let metadata = match entry.metadata() {
+            let entry_path = dir_entry.path();
+            let metadata = match fs::symlink_metadata(&entry_path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            let file_name = entry.file_name().to_string_lossy().to_string();
             entries.push(create_entry_info(
                 &file_name,
-                entry.path(),
+                entry_path,
                 metadata,
                 &ctx,
                 &recursive_sizes,
                 &recursive_counts,
                 &mut user_cache,
                 &mut group_cache,
+                now_year,
+                now_timestamp,
             ));
         }
     } else if let Some(metadata) = input_meta {
@@ -512,6 +1150,8 @@ fn main() {
             &recursive_counts,
             &mut user_cache,
             &mut group_cache,
+            now_year,
+            now_timestamp,
         ));
     }
 
@@ -540,22 +1180,9 @@ fn main() {
         return;
     }
 
-    if ctx.hyperlink {
-        let shown_file_count = entries
-            .iter()
-            .filter(|entry| {
-                let is_dirish = if entry.is_symlink {
-                    entry.is_target_dir
-                } else {
-                    entry.is_dir
-                };
-                !is_dirish
-            })
-            .count();
-        if shown_file_count > HYPERLINK_MAX_FILES {
-            ctx.hyperlink = false;
-        }
-    }
+    let over_auto_limit = entries.len() > AUTO_STYLE_MAX_ENTRIES;
+    ctx.color_enabled = output_enabled(cli.color, piped_output, over_auto_limit);
+    ctx.hyperlink = output_enabled(cli.hyperlink, piped_output, over_auto_limit);
 
     entries.sort_by(|a, b| {
         match ctx.sort_by {
@@ -1172,6 +1799,8 @@ fn create_entry_info(
     recursive_counts: &HashMap<OsString, (u64, u64)>,
     user_cache: &mut HashMap<u32, String>,
     group_cache: &mut HashMap<u32, String>,
+    now_year: i32,
+    now_timestamp: i64,
 ) -> EntryInfo {
     let is_symlink = metadata.file_type().is_symlink();
     let is_dir = metadata.is_dir();
@@ -1283,16 +1912,7 @@ fn create_entry_info(
     };
 
     let time_str = if ctx.show_time {
-        let mtime = sort_mtime;
-        let dt: DateTime<Local> = DateTime::from_timestamp(mtime, 0)
-            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
-            .with_timezone(&Local);
-        let now = Local::now();
-        if now.year() == dt.year() && (now.timestamp() - dt.timestamp()).abs() < 15552000 {
-            dt.format("%e %b %H:%M").to_string()
-        } else {
-            dt.format("%e %b  %Y").to_string()
-        }
+        format_time_display(sort_mtime, now_year, now_timestamp)
     } else {
         String::new()
     };
