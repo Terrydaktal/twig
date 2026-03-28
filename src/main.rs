@@ -74,6 +74,10 @@ struct Cli {
     #[arg(short = 'L', long = "list")]
     list: bool,
 
+    /// List directories themselves, not their contents
+    #[arg(short = 'd', long = "directory")]
+    directory: bool,
+
     /// Show permissions
     #[arg(short, long)]
     permissions: bool,
@@ -127,7 +131,7 @@ struct Cli {
     absolute: bool,
 
     /// Dereference symlink targets for size/time calculations
-    #[arg(short = 'd', long = "dereference")]
+    #[arg(short = 'D', long = "dereference")]
     dereference: bool,
 
     /// Show Git columns: file status in repos and repo-root status for listed repo dirs
@@ -431,7 +435,7 @@ fn main() {
     let input_meta = fs::symlink_metadata(input_path).ok();
     let input_is_dir = input_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
 
-    if cli.all && input_is_dir {
+    if cli.all && input_is_dir && !cli.directory {
         if let Ok(m) = fs::symlink_metadata(&cli.path) {
             entries.push(create_entry_info(
                 ".",
@@ -465,7 +469,7 @@ fn main() {
         }
     }
 
-    if input_is_dir {
+    if input_is_dir && !cli.directory {
         let walk_dir = WalkDir::new(&cli.path)
             .max_depth(1)
             .skip_hidden(!show_hidden);
@@ -511,13 +515,21 @@ fn main() {
         ));
     }
 
-    if cli.all && cli.true_size && input_is_dir {
+    if cli.all && cli.true_size && input_is_dir && !cli.directory {
         let dot_true_size = root_true_size.unwrap_or_else(|| {
             recursive_dir_on_disk_size(Path::new(&cli.path), show_hidden, cli.dedupe_hardlinks)
         });
         if let Some(dot_entry) = entries.iter_mut().find(|e| e.display_name == ".") {
             dot_entry.true_size_str = format_size(dot_true_size);
             dot_entry.final_size = dot_true_size;
+        }
+    }
+    if cli.directory && cli.true_size && input_is_dir {
+        if let Some(dir_entry) = entries.get_mut(0) {
+            if let Some(total_true_size) = root_true_size {
+                dir_entry.true_size_str = format_size(total_true_size);
+                dir_entry.final_size = total_true_size;
+            }
         }
     }
 

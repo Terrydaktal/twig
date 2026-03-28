@@ -70,6 +70,7 @@ From `twig --help`:
 - `-A, --almost-all` list hidden but exclude `.` and `..`
 - `-l, --long` shorthand for `-Lptos --show-targets`
 - `-L, --list` force one-entry-per-line list mode
+- `-d, --directory` list a directory entry itself (do not list its contents)
 - `-p, --permissions` show permission bits
 - `-s, --size` show logical file size and allocated dir size
 - `-c, --counts` show recursive dir/file counts for directory entries
@@ -84,7 +85,7 @@ From `twig --help`:
 - `--git` smart Git columns:
   - file staged/unstaged status when listing path is in a Git repo
   - repo-root status markers when listed entries include Git repo roots
-- `-d, --dereference` use symlink target size/time fields for `-s`/`-S`/`-t`
+- `-D, --dereference` use symlink target size/time fields for `-s`/`-S`/`-t`
 - `-S, --true-size` show allocated file size + recursive allocated dir size
 - `-H, --no-dedupe-hardlinks` disable hardlink dedupe for `-S`
 - `--header` show list headers (moved to bottom with `-r`)
