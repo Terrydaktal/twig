@@ -3,10 +3,12 @@ use clap::{Parser, ValueEnum};
 use jemallocator::Jemalloc;
 use jwalk::WalkDir;
 use lscolors::{LsColors, Style};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -19,6 +21,14 @@ use users::{get_group_by_gid, get_user_by_uid};
 static GLOBAL: Jemalloc = Jemalloc;
 
 const AUTO_STYLE_MAX_ENTRIES: usize = 1000;
+const NTFS_FS_TYPES: [&str; 3] = ["ntfs", "ntfs3", "fuseblk"];
+
+#[derive(Clone)]
+struct MountInfo {
+    device: PathBuf,
+    mount_point: PathBuf,
+    fs_type: String,
+}
 
 #[derive(ValueEnum, Clone, Debug, Copy, PartialEq)]
 enum SortBy {
@@ -119,7 +129,7 @@ struct Cli {
     #[arg(long, value_enum, default_value = "auto")]
     color: OutputWhen,
 
-    /// Render names as terminal hyperlinks
+    /// Render names as terminal hyperlinks (default: never; plain -U means auto)
     #[arg(
         short = 'U',
         long,
@@ -637,14 +647,16 @@ fn try_render_large_dir_fast_path(
     }
 
     let mut out = String::new();
-    for entry in &entries {
+    for (idx, entry) in entries.iter().enumerate() {
+        if idx > 0 {
+            out.push_str("  ");
+        }
         let painted = paint_name_fast(&entry.display_name, &entry.actual_path, ctx);
         if ctx.hyperlink {
             out.push_str(&hyperlink_path(&entry.actual_path, &painted));
         } else {
             out.push_str(&painted);
         }
-        out.push_str("  ");
     }
     out.push('\n');
     Some(out)
@@ -1253,7 +1265,10 @@ fn main() {
         print_detailed_list(&entries, &ctx, &detail_columns)
     } else {
         let mut out = String::new();
-        for entry in &entries {
+        for (idx, entry) in entries.iter().enumerate() {
+            if idx > 0 {
+                out.push_str("  ");
+            }
             if entry.is_symlink && entry.broken_symlink {
                 let mut broken_text =
                     get_display_name_text(&entry.render_name, &entry.metadata, &ctx);
@@ -1285,7 +1300,6 @@ fn main() {
                     }
                 }
             }
-            out.push_str("  ");
         }
         out.push('\n');
         out
@@ -1567,6 +1581,709 @@ fn on_disk_size(metadata: &fs::Metadata) -> u64 {
     metadata.blocks() * 512
 }
 
+fn is_hidden_name(name: &OsStr) -> bool {
+    name.as_bytes().first().copied() == Some(b'.')
+}
+
+fn unescape_proc_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let a = bytes[i + 1];
+            let b = bytes[i + 2];
+            let c = bytes[i + 3];
+            let octal = (b'0'..=b'7').contains(&a)
+                && (b'0'..=b'7').contains(&b)
+                && (b'0'..=b'7').contains(&c);
+            if octal {
+                let value = ((a - b'0') << 6) | ((b - b'0') << 3) | (c - b'0');
+                out.push(value);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn detect_mount_info(path: &Path) -> Option<MountInfo> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    let mut best: Option<(usize, MountInfo)> = None;
+
+    for line in mounts.lines() {
+        let mut parts = line.split_whitespace();
+        let (device_raw, mount_point_raw, fs_type) =
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(device), Some(mount), Some(fs_type)) => (device, mount, fs_type),
+                _ => continue,
+            };
+        let device = PathBuf::from(unescape_proc_mount_field(device_raw));
+        let mount_point = PathBuf::from(unescape_proc_mount_field(mount_point_raw));
+        if !canonical.starts_with(&mount_point) {
+            continue;
+        }
+        let mount_len = mount_point.as_os_str().as_bytes().len();
+        if best
+            .as_ref()
+            .map(|(best_len, _)| mount_len > *best_len)
+            .unwrap_or(true)
+        {
+            best = Some((
+                mount_len,
+                MountInfo {
+                    device,
+                    mount_point,
+                    fs_type: fs_type.to_string(),
+                },
+            ));
+        }
+    }
+
+    best.map(|(_, info)| info)
+}
+
+fn detect_filesystem_type(path: &Path) -> Option<String> {
+    detect_mount_info(path).map(|info| info.fs_type)
+}
+
+fn is_ntfs_like_filesystem(path: &Path) -> bool {
+    detect_filesystem_type(path)
+        .map(|fs_type| NTFS_FS_TYPES.iter().any(|t| fs_type == *t))
+        .unwrap_or(false)
+}
+
+fn ntfs_best_filename(
+    entry: &ntfs::NtfsIndexEntry<'_, ntfs::indexes::NtfsFileNameIndex>,
+) -> Option<String> {
+    if let Some(Ok(file_name)) = entry.key() {
+        let name = file_name.name().to_string_lossy().to_string();
+        if !name.contains('~') || name.len() > 12 {
+            return Some(name);
+        }
+    }
+    entry
+        .key()
+        .and_then(|result| result.ok())
+        .map(|file_name| file_name.name().to_string_lossy().to_string())
+}
+
+fn ntfs_is_reparse_point(file: &ntfs::NtfsFile, device: &mut fs::File) -> bool {
+    let mut attrs = file.attributes();
+    while let Some(attr_result) = attrs.next(device) {
+        if let Ok(attr_item) = attr_result {
+            if let Ok(attr) = attr_item.to_attribute() {
+                if let Ok(attr_ty) = attr.ty() {
+                    if attr_ty == ntfs::NtfsAttributeType::ReparsePoint {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn ntfs_file_logical_size(file: &ntfs::NtfsFile, device: &mut fs::File) -> u64 {
+    if let Some(data_attr) = file.data(device, "") {
+        if let Ok(data_item) = data_attr {
+            if let Ok(data_attr_obj) = data_item.to_attribute() {
+                if let Ok(value) = data_attr_obj.value(device) {
+                    return value.len();
+                }
+            }
+        }
+    }
+    0
+}
+
+fn fs_block_size(path: &Path) -> u64 {
+    let path_c = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return 4096,
+    };
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(path_c.as_ptr(), &mut stat as *mut _) };
+    if rc == 0 && stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        4096
+    }
+}
+
+fn round_up_to_block(size: u64, block_size: u64) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+    if block_size <= 1 {
+        return size;
+    }
+    size.div_ceil(block_size) * block_size
+}
+
+fn ntfs_find_subdir_record(
+    ntfs: &ntfs::Ntfs,
+    device: &mut fs::File,
+    start_record: u64,
+    rel_path: &Path,
+) -> Option<u64> {
+    let mut current_record = start_record;
+    if rel_path.as_os_str().is_empty() {
+        return Some(current_record);
+    }
+
+    for component in rel_path.components() {
+        let name = match component {
+            Component::Normal(name) => name.to_string_lossy().to_string(),
+            _ => continue,
+        };
+        let dir_file = ntfs.file(device, current_record).ok()?;
+        let index = dir_file.directory_index(device).ok()?;
+        let mut entries = index.entries();
+        let mut seen_records = HashSet::<u64>::new();
+        let mut next_record: Option<u64> = None;
+
+        while let Some(entry_result) = entries.next(device) {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let entry_name = match ntfs_best_filename(&entry) {
+                Some(n) => n,
+                None => continue,
+            };
+            if entry_name == "." || entry_name == ".." {
+                continue;
+            }
+            let child_record = entry.file_reference().file_record_number();
+            if !seen_records.insert(child_record) {
+                continue;
+            }
+            if entry_name == name {
+                next_record = Some(child_record);
+                break;
+            }
+        }
+        current_record = next_record?;
+    }
+
+    Some(current_record)
+}
+
+fn ntfs_scan_subtree_record(
+    ntfs: &ntfs::Ntfs,
+    device: &mut fs::File,
+    top_record: u64,
+    show_hidden: bool,
+    need_sizes: bool,
+    need_counts: bool,
+    block_size: u64,
+    shared_seen: Option<&Arc<Mutex<HashSet<u64>>>>,
+) -> (u64, u64, u64) {
+    let mut total_size = 0u64;
+    let mut total_dirs = 0u64;
+    let mut total_files = 0u64;
+    let mut stack = vec![top_record];
+    let mut seen_dirs = HashSet::<u64>::new();
+
+    while let Some(current_record) = stack.pop() {
+        if !seen_dirs.insert(current_record) {
+            continue;
+        }
+        let dir_file = match ntfs.file(device, current_record) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        if need_sizes {
+            total_size += block_size;
+        }
+        let index = match dir_file.directory_index(device) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        let mut entries = index.entries();
+        let mut seen_records = HashSet::<u64>::new();
+
+        while let Some(entry_result) = entries.next(device) {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name = match ntfs_best_filename(&entry) {
+                Some(n) => n,
+                None => continue,
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let child_record = entry.file_reference().file_record_number();
+            if !seen_records.insert(child_record) {
+                continue;
+            }
+            let child_file = match ntfs.file(device, child_record) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let child_is_dir = child_file.is_directory();
+            let child_is_reparse = ntfs_is_reparse_point(&child_file, device);
+
+            if child_is_dir && !child_is_reparse {
+                if need_counts {
+                    total_dirs += 1;
+                }
+                stack.push(child_record);
+            } else {
+                if need_counts {
+                    total_files += 1;
+                }
+                if need_sizes {
+                    let mut include_size = true;
+                    if let Some(seen) = shared_seen {
+                        if let Ok(mut set) = seen.lock() {
+                            include_size = set.insert(child_record);
+                        }
+                    }
+                    if include_size {
+                        let logical_size = ntfs_file_logical_size(&child_file, device);
+                        total_size += round_up_to_block(logical_size, block_size);
+                    }
+                }
+            }
+        }
+    }
+
+    (total_size, total_dirs, total_files)
+}
+
+fn collect_recursive_stats_ntfs_mft(
+    base_path: &Path,
+    show_hidden: bool,
+    dedupe_hardlinks: bool,
+    need_sizes: bool,
+    need_counts: bool,
+) -> io::Result<(
+    HashMap<OsString, u64>,
+    HashMap<OsString, (u64, u64)>,
+    Option<u64>,
+)> {
+    let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+    let mount = detect_mount_info(&canonical_base)
+        .ok_or_else(|| io::Error::other("mount detection failed"))?;
+    if !NTFS_FS_TYPES.iter().any(|t| mount.fs_type == *t) {
+        return Err(io::Error::other("not ntfs"));
+    }
+
+    let mut device = fs::File::open(&mount.device)?;
+    let ntfs = ntfs::Ntfs::new(&mut device).map_err(|err| io::Error::other(err.to_string()))?;
+    let root_dir = ntfs
+        .root_directory(&mut device)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let root_record = root_dir.file_record_number();
+    let rel_path = canonical_base
+        .strip_prefix(&mount.mount_point)
+        .unwrap_or(Path::new(""));
+    let base_record = ntfs_find_subdir_record(&ntfs, &mut device, root_record, rel_path)
+        .ok_or_else(|| io::Error::other("base directory not found in mft"))?;
+
+    let block_size = fs_block_size(&canonical_base);
+    let available_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let ntfs_threads = std::env::var("TWIG_NTFS_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| available_threads.min(4).max(1));
+    let mut recursive_sizes: HashMap<OsString, u64> = HashMap::new();
+    let mut recursive_counts: HashMap<OsString, (u64, u64)> = HashMap::new();
+    let mut top_level_dirs: Vec<(OsString, u64)> = Vec::new();
+    let shared_seen = if need_sizes && dedupe_hardlinks {
+        Some(Arc::new(Mutex::new(HashSet::<u64>::new())))
+    } else {
+        None
+    };
+    let mut root_recursive_size = if need_sizes {
+        fs::symlink_metadata(&canonical_base)
+            .map(|m| on_disk_size(&m))
+            .unwrap_or(block_size)
+    } else {
+        0
+    };
+
+    let base_file = ntfs
+        .file(&mut device, base_record)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let index = base_file
+        .directory_index(&mut device)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let mut entries = index.entries();
+    let mut seen_records = HashSet::<u64>::new();
+
+    while let Some(entry_result) = entries.next(&mut device) {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = match ntfs_best_filename(&entry) {
+            Some(n) => n,
+            None => continue,
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let child_record = entry.file_reference().file_record_number();
+        if !seen_records.insert(child_record) {
+            continue;
+        }
+        let child_file = match ntfs.file(&mut device, child_record) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let child_is_dir = child_file.is_directory();
+        let child_is_reparse = ntfs_is_reparse_point(&child_file, &mut device);
+
+        if child_is_dir && !child_is_reparse {
+            top_level_dirs.push((OsString::from(name), child_record));
+        } else if need_sizes {
+            let mut include_size = true;
+            if let Some(seen) = shared_seen.as_ref() {
+                if let Ok(mut set) = seen.lock() {
+                    include_size = set.insert(child_record);
+                }
+            }
+            if include_size {
+                root_recursive_size +=
+                    round_up_to_block(ntfs_file_logical_size(&child_file, &mut device), block_size);
+            }
+        }
+    }
+
+    let run_scan = |dirs: Vec<(OsString, u64)>| {
+        dirs.into_par_iter()
+            .map(|(name, record)| {
+                let mut thread_device = fs::File::open(&mount.device).map_err(|_| ())?;
+                let thread_ntfs = ntfs::Ntfs::new(&mut thread_device).map_err(|_| ())?;
+                let (size, dirs_count, file_count) = ntfs_scan_subtree_record(
+                    &thread_ntfs,
+                    &mut thread_device,
+                    record,
+                    show_hidden,
+                    need_sizes,
+                    need_counts,
+                    block_size,
+                    shared_seen.as_ref(),
+                );
+                Ok::<(OsString, u64, u64, u64), ()>((name, size, dirs_count, file_count))
+            })
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+    };
+
+    let dir_results: Vec<(OsString, u64, u64, u64)> = if ntfs_threads <= 1 || top_level_dirs.len() <= 1
+    {
+        top_level_dirs
+            .into_iter()
+            .filter_map(|(name, record)| {
+                let (size, dirs_count, file_count) = ntfs_scan_subtree_record(
+                    &ntfs,
+                    &mut device,
+                    record,
+                    show_hidden,
+                    need_sizes,
+                    need_counts,
+                    block_size,
+                    shared_seen.as_ref(),
+                );
+                Some((name, size, dirs_count, file_count))
+            })
+            .collect()
+    } else if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+        .num_threads(ntfs_threads)
+        .build()
+    {
+        pool.install(|| run_scan(top_level_dirs))
+    } else {
+        run_scan(top_level_dirs)
+    };
+
+    for (name, size, dirs_count, file_count) in dir_results {
+        if need_sizes {
+            recursive_sizes.insert(name.clone(), size);
+            root_recursive_size += size;
+        }
+        if need_counts {
+            recursive_counts.insert(name, (dirs_count, file_count));
+        }
+    }
+
+    Ok((
+        recursive_sizes,
+        recursive_counts,
+        if need_sizes {
+            Some(root_recursive_size)
+        } else {
+            None
+        },
+    ))
+}
+
+fn size_with_hardlink_dedupe(
+    metadata: &fs::Metadata,
+    shared_seen: Option<&Arc<Mutex<HashSet<(u64, u64)>>>>,
+) -> u64 {
+    let size = on_disk_size(metadata);
+    if metadata.is_dir() || metadata.nlink() <= 1 || shared_seen.is_none() {
+        return size;
+    }
+    if let Some(seen) = shared_seen {
+        if let Ok(mut set) = seen.lock() {
+            if set.insert((metadata.dev(), metadata.ino())) {
+                return size;
+            }
+            return 0;
+        }
+    }
+    size
+}
+
+fn scan_subtree_stats_low_overhead(
+    top_dir: &Path,
+    show_hidden: bool,
+    need_sizes: bool,
+    need_counts: bool,
+    shared_seen: Option<&Arc<Mutex<HashSet<(u64, u64)>>>>,
+) -> (u64, u64, u64) {
+    let mut total_size = 0u64;
+    let mut total_dirs = 0u64;
+    let mut total_files = 0u64;
+
+    if need_sizes {
+        if let Ok(meta) = fs::symlink_metadata(top_dir) {
+            total_size += size_with_hardlink_dedupe(&meta, shared_seen);
+        }
+    }
+
+    let mut stack = vec![top_dir.to_path_buf()];
+    while let Some(current_dir) = stack.pop() {
+        let entries = match fs::read_dir(&current_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry_res in entries {
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name = entry.file_name();
+            if !show_hidden && is_hidden_name(&name) {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let is_dir = metadata.file_type().is_dir();
+
+            if need_counts {
+                if is_dir {
+                    total_dirs += 1;
+                } else {
+                    total_files += 1;
+                }
+            }
+
+            if need_sizes {
+                total_size += size_with_hardlink_dedupe(&metadata, shared_seen);
+            }
+
+            if is_dir {
+                stack.push(path);
+            }
+        }
+    }
+
+    (total_size, total_dirs, total_files)
+}
+
+fn collect_recursive_stats_ntfs(
+    base_path: &Path,
+    show_hidden: bool,
+    dedupe_hardlinks: bool,
+    need_sizes: bool,
+    need_counts: bool,
+) -> (
+    HashMap<OsString, u64>,
+    HashMap<OsString, (u64, u64)>,
+    Option<u64>,
+) {
+    if !need_sizes && !need_counts {
+        return (HashMap::new(), HashMap::new(), None);
+    }
+
+    let ntfs_debug = std::env::var_os("TWIG_NTFS_DEBUG").is_some();
+    match collect_recursive_stats_ntfs_mft(
+        base_path,
+        show_hidden,
+        dedupe_hardlinks,
+        need_sizes,
+        need_counts,
+    ) {
+        Ok(stats) => {
+            if ntfs_debug {
+                eprintln!("twig: NTFS MFT fast path enabled");
+            }
+            return stats;
+        }
+        Err(err) => {
+            if ntfs_debug {
+                eprintln!("twig: NTFS MFT fast path unavailable: {}", err);
+            }
+        }
+    }
+
+    let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+    let mut recursive_sizes: HashMap<OsString, u64> = HashMap::new();
+    let mut recursive_counts: HashMap<OsString, (u64, u64)> = HashMap::new();
+    let mut top_level_dirs: Vec<(OsString, PathBuf)> = Vec::new();
+    let available_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let ntfs_threads = std::env::var("TWIG_NTFS_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| available_threads.min(4).max(1));
+    let shared_seen = if need_sizes && dedupe_hardlinks {
+        Some(Arc::new(Mutex::new(HashSet::<(u64, u64)>::new())))
+    } else {
+        None
+    };
+    let root_size_total = if need_sizes {
+        fs::symlink_metadata(&canonical_base)
+            .map(|m| size_with_hardlink_dedupe(&m, shared_seen.as_ref()))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut root_recursive_size = root_size_total;
+
+    let entries = match fs::read_dir(&canonical_base) {
+        Ok(e) => e,
+        Err(_) => {
+            return (
+                recursive_sizes,
+                recursive_counts,
+                if need_sizes {
+                    Some(root_recursive_size)
+                } else {
+                    None
+                },
+            );
+        }
+    };
+
+    for entry_res in entries {
+        let entry = match entry_res {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        if !show_hidden && is_hidden_name(&name) {
+            continue;
+        }
+        let child_path = entry.path();
+        if need_sizes {
+            let metadata = match fs::symlink_metadata(&child_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.file_type().is_dir() {
+                top_level_dirs.push((name, child_path));
+            } else {
+                root_recursive_size += size_with_hardlink_dedupe(&metadata, shared_seen.as_ref());
+            }
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            top_level_dirs.push((name, child_path));
+        }
+    }
+
+    let run_scan = |dirs: Vec<(OsString, PathBuf)>| {
+        dirs.into_par_iter()
+            .map(|(name, dir_path)| {
+                let (size, dirs, files) = scan_subtree_stats_low_overhead(
+                    &dir_path,
+                    show_hidden,
+                    need_sizes,
+                    need_counts,
+                    shared_seen.as_ref(),
+                );
+                (name, size, dirs, files)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let dir_results: Vec<(OsString, u64, u64, u64)> = if ntfs_threads <= 1 || top_level_dirs.len() <= 1
+    {
+        top_level_dirs
+            .into_iter()
+            .map(|(name, dir_path)| {
+                let (size, dirs, files) = scan_subtree_stats_low_overhead(
+                    &dir_path,
+                    show_hidden,
+                    need_sizes,
+                    need_counts,
+                    shared_seen.as_ref(),
+                );
+                (name, size, dirs, files)
+            })
+            .collect()
+    } else if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+        .num_threads(ntfs_threads)
+        .build()
+    {
+        pool.install(|| run_scan(top_level_dirs))
+    } else {
+        run_scan(top_level_dirs)
+    };
+
+    for (name, size, dirs, files) in dir_results {
+        if need_sizes {
+            recursive_sizes.insert(name.clone(), size);
+            root_recursive_size += size;
+        }
+        if need_counts {
+            recursive_counts.insert(name, (dirs, files));
+        }
+    }
+
+    (
+        recursive_sizes,
+        recursive_counts,
+        if need_sizes {
+            Some(root_recursive_size)
+        } else {
+            None
+        },
+    )
+}
+
 fn collect_recursive_stats(
     base_path: &Path,
     show_hidden: bool,
@@ -1583,6 +2300,15 @@ fn collect_recursive_stats(
     }
 
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+    if is_ntfs_like_filesystem(&canonical_base) {
+        return collect_recursive_stats_ntfs(
+            &canonical_base,
+            show_hidden,
+            dedupe_hardlinks,
+            need_sizes,
+            need_counts,
+        );
+    }
     let scan_root = canonical_base.clone();
     // Top-level keyed aggregation: key is immediate child directory name.
     let dir_local_stats = Arc::new(Mutex::new(HashMap::<OsString, (u64, u64, u64)>::new()));
@@ -1758,6 +2484,21 @@ fn collect_recursive_stats(
 
 fn recursive_dir_on_disk_size(base_path: &Path, show_hidden: bool, dedupe_hardlinks: bool) -> u64 {
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+    if is_ntfs_like_filesystem(&canonical_base) {
+        let shared_seen = if dedupe_hardlinks {
+            Some(Arc::new(Mutex::new(HashSet::<(u64, u64)>::new())))
+        } else {
+            None
+        };
+        let (size, _, _) = scan_subtree_stats_low_overhead(
+            &canonical_base,
+            show_hidden,
+            true,
+            false,
+            shared_seen.as_ref(),
+        );
+        return size;
+    }
     let mut total = 0u64;
     let mut seen_inodes = if dedupe_hardlinks {
         Some(HashSet::<(u64, u64)>::new())
@@ -2380,7 +3121,7 @@ fn get_symlink_target_display(link_path: &Path, target: &Path, ctx: &Context) ->
         link_path.parent().map(|p| p.join(target))
     };
 
-    let painted = if let Some(path) = resolved_target.as_deref() {
+    if let Some(path) = resolved_target.as_deref() {
         let target_metadata = fs::symlink_metadata(path).ok();
         if ctx.classify {
             if let Some(m) = target_metadata.as_ref() {
@@ -2428,23 +3169,36 @@ fn get_symlink_target_display(link_path: &Path, target: &Path, ctx: &Context) ->
             }
             None => basename_with_suffix,
         };
-        if prefix.is_empty() {
-            styled_basename
+
+        let styled_prefix = if prefix.is_empty() {
+            String::new()
         } else if !ctx.color_enabled {
-            format!("{}{}", prefix, styled_basename)
+            prefix.to_string()
         } else {
-            format!("\x1b[38;2;255;255;255m{}\x1b[0m{}", prefix, styled_basename)
+            format!("\x1b[38;2;255;255;255m{}\x1b[0m", prefix)
+        };
+
+        if ctx.hyperlink {
+            let mut out = String::new();
+            if !styled_prefix.is_empty() {
+                let prefix_target = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("/"));
+                out.push_str(&hyperlink_path(&prefix_target, &styled_prefix));
+            }
+            out.push_str(&hyperlink_path(path, &styled_basename));
+            return out;
+        }
+
+        if styled_prefix.is_empty() {
+            styled_basename
+        } else {
+            format!("{}{}", styled_prefix, styled_basename)
         }
     } else {
         display_text
-    };
-
-    if ctx.hyperlink {
-        if let Some(path) = resolved_target {
-            return hyperlink_path(&path, &painted);
-        }
     }
-    painted
 }
 
 fn format_permissions(mode: u32, color_enabled: bool) -> String {

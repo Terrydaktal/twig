@@ -1,6 +1,6 @@
 [package]
 name = "twig"
-version = "0.0.6"
+version = "0.0.8"
 edition = "2024"
 
 [dependencies]
@@ -11,7 +11,9 @@ jemallocator = "0.5.4"
 jwalk = "0.8.1"
 libc = "0.2.183"
 lscolors = "0.21.0"
+ntfs = "0.4.0"
 nu-ansi-term = "0.50.3"
+rayon = "1.11.0"
 users = "0.11.0"
 
 [profile.release]
