@@ -207,6 +207,7 @@ struct Context {
     header: bool,
     column_preference: Vec<DetailColumn>,
     sort_by: SortBy,
+    sort_counts_total: bool,
 }
 
 struct EntryInfo {
@@ -362,6 +363,49 @@ fn sort_was_explicitly_set() -> bool {
     }
 
     false
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImplicitSort {
+    Counts,
+    TrueSize,
+}
+
+fn implicit_sort_from_flag_order() -> Option<ImplicitSort> {
+    let mut stop_parsing_flags = false;
+
+    for arg in std::env::args_os().skip(1) {
+        let arg = arg.to_string_lossy();
+        if stop_parsing_flags {
+            continue;
+        }
+        if arg == "--" {
+            stop_parsing_flags = true;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            match long {
+                "counts" => return Some(ImplicitSort::Counts),
+                "true-size" => return Some(ImplicitSort::TrueSize),
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(shorts) = arg.strip_prefix('-') {
+            if shorts.is_empty() {
+                continue;
+            }
+            for ch in shorts.chars() {
+                match ch {
+                    'c' => return Some(ImplicitSort::Counts),
+                    'S' => return Some(ImplicitSort::TrueSize),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn is_detail_column_enabled(column: DetailColumn, ctx: &Context) -> bool {
@@ -996,6 +1040,18 @@ fn output_enabled(mode: OutputWhen, piped_output: bool, over_auto_limit: bool) -
 fn main() {
     let cli = Cli::parse();
     let sort_explicit = sort_was_explicitly_set();
+    let implicit_sort = if sort_explicit {
+        None
+    } else {
+        implicit_sort_from_flag_order()
+    };
+    let effective_sort = match implicit_sort {
+        Some(ImplicitSort::Counts) => SortBy::DirCount,
+        Some(ImplicitSort::TrueSize) => SortBy::Size,
+        None => cli.sort,
+    };
+    let implicit_ascending_sort = implicit_sort.is_some();
+    let sort_counts_total = matches!(implicit_sort, Some(ImplicitSort::Counts));
     let show_hidden = cli.all || cli.almost_all;
 
     let piped_output = !io::stdout().is_terminal();
@@ -1027,10 +1083,11 @@ fn main() {
         reverse: cli.reverse,
         header: cli.header,
         column_preference: parse_detail_column_preference(),
-        sort_by: cli.sort,
+        sort_by: effective_sort,
+        sort_counts_total,
     };
     let mut entries = Vec::new();
-    let need_counts = cli.counts || matches!(cli.sort, SortBy::DirCount | SortBy::FileCount);
+    let need_counts = cli.counts || matches!(effective_sort, SortBy::DirCount | SortBy::FileCount);
     let (recursive_sizes, recursive_counts, root_true_size) = collect_recursive_stats(
         Path::new(&cli.path),
         show_hidden,
@@ -1196,6 +1253,7 @@ fn main() {
     ctx.color_enabled = output_enabled(cli.color, piped_output, over_auto_limit);
     ctx.hyperlink = output_enabled(cli.hyperlink, piped_output, over_auto_limit);
 
+    let reverse_sorted_output = cli.reverse ^ implicit_ascending_sort;
     entries.sort_by(|a, b| {
         match ctx.sort_by {
             SortBy::Size => {
@@ -1221,7 +1279,22 @@ fn main() {
                 }
             }
             SortBy::DirCount => {
-                if a.dir_count != b.dir_count {
+                let a_count = if ctx.sort_counts_total {
+                    a.dir_count.saturating_add(a.file_count)
+                } else {
+                    a.dir_count
+                };
+                let b_count = if ctx.sort_counts_total {
+                    b.dir_count.saturating_add(b.file_count)
+                } else {
+                    b.dir_count
+                };
+                if a_count != b_count {
+                    return b_count.cmp(&a_count);
+                }
+                if ctx.sort_counts_total && a.dir_count != b.dir_count {
+                    // For implicit -c total sorting, ties prefer files over dirs
+                    // in ascending output after the final reverse pass.
                     return b.dir_count.cmp(&a.dir_count);
                 }
             }
@@ -1237,7 +1310,7 @@ fn main() {
         }
         a.display_name.cmp(&b.display_name)
     });
-    if cli.reverse {
+    if reverse_sorted_output {
         entries.reverse();
     }
     if cli.all && input_is_dir && !sort_explicit {
@@ -2613,7 +2686,7 @@ fn create_entry_info(
             .copied()
             .unwrap_or((0, 0))
     } else {
-        (0, 0)
+        (0, 1)
     };
     let dir_count_str = dir_count.to_string();
     let file_count_str = file_count.to_string();

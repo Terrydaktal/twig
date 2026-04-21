@@ -1,13 +1,13 @@
 # twig
 
-`twig` is a single-binary Rust CLI that lists one directory level (`max_depth = 1`) with optional long-format metadata, sorting, Git integration, symlink target rendering, hyperlink support, and path caching for shell tooling.
+`twig` is a single-binary Rust CLI that lists one directory level (`max_depth = 1`) with optional long-format metadata, sorting, Git integration, symlink target rendering, hyperlink support, path caching for shell tooling, and NTFS-aware recursive stats fast paths.
 
 ## Justification
 
 1. When piping or when there are >1000 entries in the listing, `--color=auto` and `--hyperlink=auto` flags do not apply colour or hyperlinks, and instead use a fast mode.  
    - Benchmarking with hyperlinks and colours disabled on all `twig` is **2–3× faster** than `/bin/ls` (with `twig -la` same speed as `/bin/ls -la`) and **8–12× faster** than `eza` (with `twig -la` **1.5× faster** than `eza -la`).  
    - With hyperlinks and colour forced on both, `twig` is **4× faster** than `eza` with hyperlinks and colour (with `twig -la` **2.2× faster** than `eza -la`).
-2. `twig -S` is **5–6× faster** than `eza --total-size` and around **2.3× faster** than `dust -d 1` on large directories with many recursive files (e.g., `~`).
+2. On NTFS-like mounts, recursive stats (`-S`, `-c`, `--sort dircount|filecount`) attempt an MFT-based fast path first, then automatically fall back to regular filesystem scanning when unavailable.
 3. `--cache-raw` writes full directory/file path lists to `/tmp/fzf-history-$USER/universal-last-{dirs,files}-<fish_pid>`, allowing quick access to listed files with a fuzzy picker.
 4. `-c`, `--counts` – recursive directory/file count columns. Supports `--sort dircount` and `--sort filecount`.
 5. `eza` `--git-repos` and `--git` are combined into a smart `--git` flag that shows either or both columns when relevant
@@ -38,8 +38,11 @@
 
 - `src/main.rs`
   - Defines CLI flags/options (`clap` derive)
-  - Scans directory entries with `jwalk`
+  - Scans visible listing entries with `std::fs::read_dir` (one level)
+  - Uses `jwalk` for recursive fallback aggregation paths
   - Computes size fields (`-s` vs `-S`)
+  - Computes recursive stats for `-S`, `-c`, and `--sort dircount|filecount`
+  - Detects NTFS mounts and attempts an MFT recursive scanner
   - Computes Git columns (`--git`)
   - Styles output using `LS_COLORS`
   - Handles symlink arrows/targets and broken-link highlighting
@@ -91,7 +94,8 @@ From `twig --help`:
 - `-r, --reverse` reverse listing order
 - `-U, --hyperlink[=<always|auto|never>]` render names as OSC8 hyperlinks
 - `-x, --show-targets` show symlink target paths
-- `--git` smart Git columns:
+- `-X, --absolute` show absolute paths in output
+- `-G, --git` smart Git columns:
   - file staged/unstaged status when listing path is in a Git repo
   - repo-root status markers when listed entries include Git repo roots
 - `-D, --dereference` use symlink target size/time fields for `-s`/`-S`/`-t`
@@ -106,8 +110,12 @@ From `twig --help`:
 For each invocation, `twig` runs roughly this pipeline:
 
 1. Parse CLI flags and build rendering context.
-2. Optionally precompute recursive true-size totals (only for `-S`), including root total for `.` in `-a -S`, in one traversal.
-3. Scan one directory level using `jwalk` (`max_depth(1)`).
+2. Optionally precompute recursive stats when needed:
+   - recursive sizes for `-S`
+   - recursive counts for `-c` and `--sort dircount|filecount`
+   - root recursive total for injected `.` in `-a -S`
+   - on NTFS-like mounts, attempts MFT scan first and falls back automatically
+3. Scan one directory level for displayed entries (`std::fs::read_dir`).
 4. Build per-entry metadata struct:
    - file type
    - symlink target/broken state
@@ -124,6 +132,18 @@ For each invocation, `twig` runs roughly this pipeline:
 8. Optionally write raw path cache files (`--cache-raw`).
 9. Render all rows into one buffered `String`.
 10. Single `stdout.lock().write_all(...)` write.
+
+## NTFS Fast Path (`-S`, `-c`, `--sort dircount|filecount`)
+
+When the listing path is on `ntfs`, `ntfs3`, or `fuseblk`:
+
+1. `twig` tries an MFT-based recursive scan via the underlying block device.
+2. If that is unavailable (for example permission/device access), `twig` falls back to normal filesystem recursion.
+
+Environment controls:
+
+- `TWIG_NTFS_THREADS=<n>`: overrides NTFS recursive scanner worker count.
+- `TWIG_NTFS_DEBUG=1`: prints whether MFT fast path was enabled or unavailable.
 
 ## Size Semantics
 
@@ -290,6 +310,8 @@ Detailed row columns are assembled left-to-right as enabled:
 Core crates:
 - `clap` for CLI parsing
 - `jwalk` for fast traversal
+- `rayon` for parallel recursive stats
+- `ntfs` for MFT-based NTFS recursive scanning
 - `lscolors` + `nu-ansi-term` for styling
 - `chrono` for timestamp formatting
 - `users` for uid/gid resolution
@@ -301,6 +323,8 @@ Core crates:
 - Git status is computed via `git status --porcelain=v1`.
 - Repo-root marker is shown only for directories that are Git toplevel roots.
 - Size units are decimal text with `K/M/G` suffixes, one decimal above bytes.
+- `--cache-raw` is disabled automatically when stdout is not a TTY.
+- NTFS MFT fast path generally requires raw block-device access (often root privileges).
 
 ## Development
 
