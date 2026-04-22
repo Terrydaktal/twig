@@ -157,6 +157,10 @@ struct Cli {
     #[arg(short = 'G', long)]
     git: bool,
 
+    /// Fetch remotes for all Git repo roots in the listed directory before rendering
+    #[arg(long = "git-fetch")]
+    git_fetch: bool,
+
     /// Show true size: files use allocated blocks; dirs use recursive allocated blocks
     #[arg(short = 'S', long = "true-size")]
     true_size: bool,
@@ -191,6 +195,7 @@ struct Context {
     show_perms: bool,
     show_size_logical: bool,
     show_size_true: bool,
+    replace_size_with_true: bool,
     show_counts: bool,
     show_owner: bool,
     show_group: bool,
@@ -201,6 +206,7 @@ struct Context {
     dereference: bool,
     show_git: bool,
     show_git_repos: bool,
+    show_git_remote: bool,
     show_hidden: bool,
     dedupe_hardlinks: bool,
     reverse: bool,
@@ -234,6 +240,7 @@ struct EntryInfo {
     broken_symlink: bool,
     git_status: Option<(char, char)>,
     repo_status: Option<char>,
+    repo_remote_status: Option<char>,
 }
 
 fn push_unique_column(columns: &mut Vec<DetailColumn>, column: DetailColumn) {
@@ -417,15 +424,25 @@ fn is_detail_column_enabled(column: DetailColumn, ctx: &Context) -> bool {
         DetailColumn::Time => ctx.show_time,
         DetailColumn::Group => ctx.show_group,
         DetailColumn::SizeTrue => ctx.show_size_true,
-        DetailColumn::Git => ctx.show_git || ctx.show_git_repos,
+        DetailColumn::Git => ctx.show_git || ctx.show_git_repos || ctx.show_git_remote,
     }
 }
 
 fn build_detail_columns(ctx: &Context) -> Vec<DetailColumn> {
     let mut columns = Vec::new();
     for column in &ctx.column_preference {
-        if is_detail_column_enabled(*column, ctx) {
-            push_unique_column(&mut columns, *column);
+        if ctx.replace_size_with_true && *column == DetailColumn::SizeTrue {
+            // In long+true-size replacement mode, keep TSIZE only in the
+            // original SIZE slot instead of honoring standalone -S position.
+            continue;
+        }
+        let effective = if ctx.replace_size_with_true && *column == DetailColumn::SizeLogical {
+            DetailColumn::SizeTrue
+        } else {
+            *column
+        };
+        if is_detail_column_enabled(effective, ctx) {
+            push_unique_column(&mut columns, effective);
         }
     }
     for column in [
@@ -1039,6 +1056,7 @@ fn output_enabled(mode: OutputWhen, piped_output: bool, over_auto_limit: bool) -
 
 fn main() {
     let cli = Cli::parse();
+    let replace_logical_size = cli.long && cli.true_size;
     let sort_explicit = sort_was_explicitly_set();
     let implicit_sort = if sort_explicit {
         None
@@ -1066,8 +1084,9 @@ fn main() {
         color_enabled,
         classify: classify_enabled,
         show_perms: cli.permissions || cli.long,
-        show_size_logical: cli.size || cli.long,
+        show_size_logical: (cli.size || cli.long) && !replace_logical_size,
         show_size_true: cli.true_size,
+        replace_size_with_true: replace_logical_size,
         show_counts: cli.counts,
         show_owner: cli.owner || cli.long,
         show_group: cli.group,
@@ -1078,6 +1097,7 @@ fn main() {
         dereference: cli.dereference,
         show_git: false,
         show_git_repos: false,
+        show_git_remote: false,
         show_hidden,
         dedupe_hardlinks: cli.dedupe_hardlinks,
         reverse: cli.reverse,
@@ -1104,6 +1124,10 @@ fn main() {
     let input_path = Path::new(&cli.path);
     let input_meta = fs::symlink_metadata(input_path).ok();
     let input_is_dir = input_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+
+    if cli.git_fetch {
+        git_fetch_repos_for_listing_path(input_path, input_is_dir);
+    }
 
     if let Some(output) = try_render_large_dir_long_fast_path(
         &cli,
@@ -1318,10 +1342,11 @@ fn main() {
     }
 
     if cli.git {
-        let (show_git_status, show_repo_status) =
+        let (show_git_status, show_repo_status, show_remote_status) =
             populate_git_columns(Path::new(&cli.path), &mut entries);
         ctx.show_git = show_git_status;
         ctx.show_git_repos = show_repo_status;
+        ctx.show_git_remote = show_remote_status;
     }
 
     if cache_raw_enabled {
@@ -1401,7 +1426,7 @@ fn collect_output_paths(entries: &[EntryInfo]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (dir_paths, file_paths)
 }
 
-fn populate_git_columns(listing_path: &Path, entries: &mut [EntryInfo]) -> (bool, bool) {
+fn populate_git_columns(listing_path: &Path, entries: &mut [EntryInfo]) -> (bool, bool, bool) {
     let listing_abs = fs::canonicalize(listing_path).unwrap_or_else(|_| to_full_path(listing_path));
 
     let show_git_status = git_repo_root(&listing_abs).is_some();
@@ -1417,6 +1442,8 @@ fn populate_git_columns(listing_path: &Path, entries: &mut [EntryInfo]) -> (bool
     }
 
     let mut show_repo_status = false;
+    let mut show_remote_status = false;
+    let mut repo_marker_cache: HashMap<PathBuf, (Option<char>, Option<char>)> = HashMap::new();
     for entry in entries.iter_mut() {
         let is_dirish = if entry.is_symlink {
             entry.is_target_dir
@@ -1426,14 +1453,21 @@ fn populate_git_columns(listing_path: &Path, entries: &mut [EntryInfo]) -> (bool
         if !is_dirish {
             continue;
         }
-        let repo_status = git_repo_root_status(&entry.actual_path);
+        let (repo_status, remote_status) = repo_marker_cache
+            .entry(entry.actual_path.clone())
+            .or_insert_with(|| git_repo_root_markers(&entry.actual_path))
+            .to_owned();
         if repo_status.is_some() {
             show_repo_status = true;
         }
         entry.repo_status = repo_status;
+        if remote_status.is_some() {
+            show_remote_status = true;
+        }
+        entry.repo_remote_status = remote_status;
     }
 
-    (show_git_status, show_repo_status)
+    (show_git_status, show_repo_status, show_remote_status)
 }
 
 fn collect_git_statuses_for_listing(listing_path: &Path) -> Option<HashMap<String, (char, char)>> {
@@ -1521,36 +1555,148 @@ fn git_repo_root(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(root))
 }
 
-fn git_repo_root_status(path: &Path) -> Option<char> {
+fn is_git_repo_root(path: &Path) -> bool {
     let abs_path = fs::canonicalize(path).unwrap_or_else(|_| to_full_path(path));
     if !abs_path.join(".git").exists() {
-        return None;
+        return false;
+    }
+    let Some(repo_root) = git_repo_root(&abs_path) else {
+        return false;
+    };
+    let repo_root_abs = fs::canonicalize(&repo_root).unwrap_or(repo_root);
+    repo_root_abs == abs_path
+}
+
+fn collect_git_repo_roots_in_directory(path: &Path) -> Vec<PathBuf> {
+    let abs_path = fs::canonicalize(path).unwrap_or_else(|_| to_full_path(path));
+    let mut roots: HashSet<PathBuf> = HashSet::new();
+
+    // Include the enclosing repo when listing inside any subdirectory of a repo.
+    if let Some(repo_root) = git_repo_root(&abs_path) {
+        roots.insert(fs::canonicalize(&repo_root).unwrap_or(repo_root));
+    }
+
+    let entries = match fs::read_dir(&abs_path) {
+        Ok(v) => v,
+        Err(_) => return roots.into_iter().collect(),
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        if !path.join(".git").exists() {
+            continue;
+        }
+        if is_git_repo_root(&path) {
+            roots.insert(fs::canonicalize(&path).unwrap_or(path));
+        }
+    }
+
+    roots.into_iter().collect()
+}
+
+fn git_fetch_repo(repo_root: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["fetch", "--all", "--prune", "--quiet"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn git_fetch_repos_for_listing_path(path: &Path, input_is_dir: bool) {
+    if !input_is_dir {
+        return;
+    }
+    let mut repos = collect_git_repo_roots_in_directory(path);
+    if repos.is_empty() {
+        return;
+    }
+    repos.sort();
+    for repo in repos {
+        let _ = git_fetch_repo(&repo);
+    }
+}
+
+fn git_repo_root_markers(path: &Path) -> (Option<char>, Option<char>) {
+    let abs_path = fs::canonicalize(path).unwrap_or_else(|_| to_full_path(path));
+    if !abs_path.join(".git").exists() {
+        return (None, None);
     }
 
     let Some(repo_root) = git_repo_root(&abs_path) else {
-        return Some('~');
+        return (Some('~'), Some('?'));
     };
     let repo_root_abs = fs::canonicalize(&repo_root).unwrap_or(repo_root);
     if repo_root_abs != abs_path {
-        return None;
+        return (None, None);
     }
 
     let output = Command::new("git")
         .arg("-C")
         .arg(&abs_path)
-        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .args(["status", "--porcelain=2", "--branch", "--untracked-files=normal"])
         .output();
     let Ok(output) = output else {
-        return Some('~');
+        return (Some('~'), Some('?'));
     };
     if !output.status.success() {
-        return Some('~');
+        return (Some('~'), Some('?'));
     }
-    if output.stdout.is_empty() {
-        Some('|')
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut has_upstream = false;
+    let mut ahead = 0u64;
+    let mut behind = 0u64;
+    let mut has_ab = false;
+    let mut dirty = false;
+
+    for line in stdout.lines() {
+        if line.starts_with("# ") {
+            if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+                if !rest.trim().is_empty() {
+                    has_upstream = true;
+                }
+            } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+                let mut parts = rest.split_whitespace();
+                let ahead_part = parts.next().unwrap_or("");
+                let behind_part = parts.next().unwrap_or("");
+                if let Some(ahead_text) = ahead_part.strip_prefix('+') {
+                    ahead = ahead_text.parse::<u64>().unwrap_or(0);
+                }
+                if let Some(behind_text) = behind_part.strip_prefix('-') {
+                    behind = behind_text.parse::<u64>().unwrap_or(0);
+                }
+                has_ab = true;
+            }
+            continue;
+        }
+        if !line.trim().is_empty() {
+            dirty = true;
+        }
+    }
+
+    let repo_status = if dirty { '+' } else { '|' };
+    let remote_status = if !has_upstream || !has_ab {
+        '?'
+    } else if ahead > 0 && behind > 0 {
+        '↕'
+    } else if ahead > 0 {
+        '↑'
+    } else if behind > 0 {
+        '↓'
     } else {
-        Some('+')
-    }
+        '✓'
+    };
+
+    (Some(repo_status), Some(remote_status))
 }
 
 fn git_status_symbol(raw: char) -> char {
@@ -1621,6 +1767,16 @@ fn git_repo_status_style(symbol: char) -> nu_ansi_term::Style {
         '+' => nu_ansi_term::Color::Red.normal(),
         '|' => nu_ansi_term::Color::Green.normal(),
         '~' => nu_ansi_term::Color::Yellow.normal(),
+        _ => nu_ansi_term::Style::default().dimmed(),
+    }
+}
+
+fn git_remote_status_style(symbol: char) -> nu_ansi_term::Style {
+    match symbol {
+        '✓' => nu_ansi_term::Color::Green.normal(),
+        '↑' | '↕' => nu_ansi_term::Color::Red.normal(),
+        '↓' => nu_ansi_term::Color::Yellow.normal(),
+        '?' => nu_ansi_term::Color::White.normal(),
         _ => nu_ansi_term::Style::default().dimmed(),
     }
 }
@@ -2755,6 +2911,7 @@ fn create_entry_info(
         broken_symlink,
         git_status: None,
         repo_status: None,
+        repo_remote_status: None,
     }
 }
 
@@ -2933,6 +3090,17 @@ fn print_detailed_list(entries: &[EntryInfo], ctx: &Context, columns: &[DetailCo
                         row.push_str(&paint_if_enabled(
                             git_repo_status_style(repo_status),
                             &repo_status.to_string(),
+                            ctx.color_enabled,
+                        ));
+                    }
+                    if ctx.show_git_remote {
+                        if ctx.show_git || ctx.show_git_repos {
+                            row.push(' ');
+                        }
+                        let remote_status = e.repo_remote_status.unwrap_or(' ');
+                        row.push_str(&paint_if_enabled(
+                            git_remote_status_style(remote_status),
+                            &remote_status.to_string(),
                             ctx.color_enabled,
                         ));
                     }
