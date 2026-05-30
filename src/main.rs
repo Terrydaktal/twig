@@ -113,6 +113,10 @@ struct Cli {
     #[arg(short = 't', long = "modified")]
     modified: bool,
 
+    /// Sort by modification date ascending
+    #[arg(short = 'T', visible_short_alias = 'D', long = "date-sort")]
+    date_sort: bool,
+
     /// Append indicator (one of /=>@|) to entries
     #[arg(short = 'F', long)]
     classify: bool,
@@ -146,11 +150,11 @@ struct Cli {
     show_targets: bool,
 
     /// Show absolute paths in output
-    #[arg(short = 'X', long = "absolute")]
+    #[arg(short = 'X', visible_short_alias = 'b', long = "absolute")]
     absolute: bool,
 
     /// Dereference symlink targets for size/time calculations
-    #[arg(short = 'D', long = "dereference")]
+    #[arg(short = '1', long = "dereference")]
     dereference: bool,
 
     /// Show Git columns: file status in repos and repo-root status for listed repo dirs
@@ -158,10 +162,10 @@ struct Cli {
     git: bool,
 
     /// Fetch remotes for all Git repo roots in the listed directory before rendering
-    #[arg(long = "git-fetch")]
+    #[arg(short = 'f', long = "git-fetch")]
     git_fetch: bool,
 
-    /// Show true size: files use allocated blocks; dirs use recursive allocated blocks
+    /// Show true size: files use allocated blocks; dirs use recursive allocated blocks (auto-sorts by size ascending)
     #[arg(short = 'S', long = "true-size")]
     true_size: bool,
 
@@ -180,7 +184,7 @@ struct Cli {
     cache_raw: bool,
 
     /// Show a header row for list/detailed output
-    #[arg(long)]
+    #[arg(short = 'v', long)]
     header: bool,
 
     /// The path to list
@@ -376,6 +380,7 @@ fn sort_was_explicitly_set() -> bool {
 enum ImplicitSort {
     Counts,
     TrueSize,
+    Date,
 }
 
 fn implicit_sort_from_flag_order() -> Option<ImplicitSort> {
@@ -394,6 +399,7 @@ fn implicit_sort_from_flag_order() -> Option<ImplicitSort> {
             match long {
                 "counts" => return Some(ImplicitSort::Counts),
                 "true-size" => return Some(ImplicitSort::TrueSize),
+                "date-sort" => return Some(ImplicitSort::Date),
                 _ => {}
             }
             continue;
@@ -406,6 +412,7 @@ fn implicit_sort_from_flag_order() -> Option<ImplicitSort> {
                 match ch {
                     'c' => return Some(ImplicitSort::Counts),
                     'S' => return Some(ImplicitSort::TrueSize),
+                    'T' | 'D' => return Some(ImplicitSort::Date),
                     _ => {}
                 }
             }
@@ -623,7 +630,7 @@ fn try_render_large_dir_fast_path(
     cli: &Cli,
     ctx: &mut Context,
     input_is_dir: bool,
-    sort_explicit: bool,
+    pin_dot_entries: bool,
     show_hidden: bool,
     piped_output: bool,
     cache_raw_enabled: bool,
@@ -686,7 +693,7 @@ fn try_render_large_dir_fast_path(
     if cli.reverse {
         entries.reverse();
     }
-    if cli.all && !sort_explicit {
+    if pin_dot_entries {
         pin_dot_entries_top_fast(&mut entries);
     }
 
@@ -859,7 +866,7 @@ fn try_render_large_dir_long_fast_path(
     cli: &Cli,
     ctx: &mut Context,
     input_is_dir: bool,
-    sort_explicit: bool,
+    pin_dot_entries: bool,
     show_hidden: bool,
     piped_output: bool,
     cache_raw_enabled: bool,
@@ -950,7 +957,7 @@ fn try_render_large_dir_long_fast_path(
     if cli.reverse {
         entries.reverse();
     }
-    if cli.all && !sort_explicit {
+    if pin_dot_entries {
         pin_dot_entries_top_long_fast(&mut entries);
     }
 
@@ -1066,10 +1073,18 @@ fn main() {
     let effective_sort = match implicit_sort {
         Some(ImplicitSort::Counts) => SortBy::DirCount,
         Some(ImplicitSort::TrueSize) => SortBy::Size,
-        None => cli.sort,
+        Some(ImplicitSort::Date) => SortBy::Date,
+        None => {
+            if cli.directory && !sort_explicit {
+                SortBy::Date
+            } else {
+                cli.sort
+            }
+        }
     };
     let implicit_ascending_sort = implicit_sort.is_some();
     let sort_counts_total = matches!(implicit_sort, Some(ImplicitSort::Counts));
+    let pin_dot_entries = !sort_explicit && implicit_sort.is_none();
     let show_hidden = cli.all || cli.almost_all;
 
     let piped_output = !io::stdout().is_terminal();
@@ -1133,7 +1148,7 @@ fn main() {
         &cli,
         &mut ctx,
         input_is_dir,
-        sort_explicit,
+        cli.all && pin_dot_entries,
         show_hidden,
         piped_output,
         cache_raw_enabled,
@@ -1147,7 +1162,7 @@ fn main() {
         &cli,
         &mut ctx,
         input_is_dir,
-        sort_explicit,
+        cli.all && pin_dot_entries,
         show_hidden,
         piped_output,
         cache_raw_enabled,
@@ -1337,7 +1352,7 @@ fn main() {
     if reverse_sorted_output {
         entries.reverse();
     }
-    if cli.all && input_is_dir && !sort_explicit {
+    if cli.all && input_is_dir && pin_dot_entries {
         pin_dot_entries_top(&mut entries);
     }
 
@@ -1347,6 +1362,11 @@ fn main() {
         ctx.show_git = show_git_status;
         ctx.show_git_repos = show_repo_status;
         ctx.show_git_remote = show_remote_status;
+        if !ctx.show_git && !ctx.show_git_repos && !ctx.show_git_remote {
+            // Keep -G in detailed/list mode even when no repo-related markers
+            // apply in the current listing.
+            ctx.show_git = true;
+        }
     }
 
     if cache_raw_enabled {
@@ -3260,6 +3280,7 @@ fn highlight_broken_symlink_text(text: &str, color_enabled: bool) -> String {
 
 fn hyperlink_path(path: &Path, text: &str) -> String {
     if let Some(abs) = to_absolute_path(path) {
+        let abs = normalize_path_lexical(&abs);
         return format!(
             "\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\",
             abs.to_string_lossy(),
