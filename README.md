@@ -90,7 +90,7 @@ From `twig --help`:
 - `-g, --group` show group
 - `-t, --modified` show mtime
 - `-F, --classify` append classifier (`/`, `@`, `*`, etc.)
-- `--sort <name|type|date|size|dircount|filecount>` sort key (default `type`)
+- `--sort <name|type|time|size|dircount|filecount>` sort key (default `type`; `date` aliases `time`)
 - `-r, --reverse` reverse listing order
 - `-U, --hyperlink[=<always|auto|never>]` render names as OSC8 hyperlinks
 - `-x, --show-targets` show symlink target paths
@@ -299,7 +299,7 @@ Detailed row columns are assembled left-to-right as enabled:
 ./target/release/twig -l --git ~/src
 
 # Reverse by date
-./target/release/twig --sort date -r
+./target/release/twig --sort time -r
 
 # Emit shell cache files for last shown dirs/files
 ./target/release/twig --cache-raw ~/Dev

@@ -34,6 +34,7 @@ struct MountInfo {
 enum SortBy {
     Name,
     Type,
+    #[value(name = "time", alias = "date")]
     Date,
     Size,
     #[value(name = "dircount")]
@@ -62,7 +63,7 @@ enum DetailColumn {
     Git,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "twig")]
 #[command(
     about = "A faster, more functional, more fine grained, more comprehensive, more user friendly and more modular eza clone",
@@ -85,9 +86,13 @@ struct Cli {
     #[arg(short = 'L', long = "list")]
     list: bool,
 
-    /// List directories themselves, not their contents
-    #[arg(short = 'd', long = "directory")]
-    directory: bool,
+    /// Only show directories in the listed folder
+    #[arg(short = 'd', long = "dirs-only")]
+    dirs_only: bool,
+
+    /// List the directory itself, not its contents
+    #[arg(short = 'n', long = "no-traverse")]
+    no_traverse: bool,
 
     /// Show permissions
     #[arg(short, long)]
@@ -97,7 +102,7 @@ struct Cli {
     #[arg(short, long)]
     size: bool,
 
-    /// Show recursive directory and file counts for directories
+    /// Show recursive directory and file counts for directories; auto-sorts by total files + dirs ascending
     #[arg(short = 'c', long = "counts")]
     counts: bool,
 
@@ -187,9 +192,13 @@ struct Cli {
     #[arg(short = 'v', long)]
     header: bool,
 
-    /// The path to list
-    #[arg(default_value = ".")]
+    /// Internal path currently being rendered
+    #[arg(skip)]
     path: String,
+
+    /// Paths to list
+    #[arg(value_name = "PATH", default_value = ".")]
+    paths: Vec<String>,
 }
 
 struct Context {
@@ -498,7 +507,7 @@ struct LongFastEntry {
 
 fn can_use_large_dir_fast_path(cli: &Cli, input_is_dir: bool) -> bool {
     input_is_dir
-        && !cli.directory
+        && !cli.no_traverse
         && !cli.long
         && !cli.list
         && !cli.header
@@ -519,7 +528,7 @@ fn can_use_large_dir_fast_path(cli: &Cli, input_is_dir: bool) -> bool {
 
 fn can_use_large_dir_long_fast_path(cli: &Cli, input_is_dir: bool) -> bool {
     input_is_dir
-        && !cli.directory
+        && !cli.no_traverse
         && cli.long
         && !cli.list
         && !cli.permissions
@@ -663,6 +672,10 @@ fn try_render_large_dir_fast_path(
             is_symlink: false,
             is_target_dir: true,
         });
+    }
+
+    if cli.dirs_only {
+        entries.retain(|entry| entry.is_dir || entry.is_target_dir);
     }
 
     if entries.len() <= AUTO_STYLE_MAX_ENTRIES {
@@ -916,6 +929,10 @@ fn try_render_large_dir_long_fast_path(
         }
     }
 
+    if cli.dirs_only {
+        entries.retain(|entry| entry.is_dir || entry.is_target_dir);
+    }
+
     if entries.len() <= AUTO_STYLE_MAX_ENTRIES {
         return None;
     }
@@ -1061,8 +1078,9 @@ fn output_enabled(mode: OutputWhen, piped_output: bool, over_auto_limit: bool) -
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn build_context_and_sort_state(
+    cli: &Cli,
+) -> (Context, bool, bool, bool, bool, bool) {
     let replace_logical_size = cli.long && cli.true_size;
     let sort_explicit = sort_was_explicitly_set();
     let implicit_sort = if sort_explicit {
@@ -1075,7 +1093,7 @@ fn main() {
         Some(ImplicitSort::TrueSize) => SortBy::Size,
         Some(ImplicitSort::Date) => SortBy::Date,
         None => {
-            if cli.directory && !sort_explicit {
+            if cli.no_traverse && !sort_explicit {
                 SortBy::Date
             } else {
                 cli.sort
@@ -1091,10 +1109,9 @@ fn main() {
     let color_enabled = output_enabled(cli.color, piped_output, false);
     let classify_enabled = cli.classify && !piped_output;
     let hyperlink_enabled = output_enabled(cli.hyperlink, piped_output, false);
-    let cache_raw_enabled = cli.cache_raw && !piped_output;
     let lscolors = LsColors::from_env().unwrap_or_default();
 
-    let mut ctx = Context {
+    let ctx = Context {
         lscolors,
         color_enabled,
         classify: classify_enabled,
@@ -1121,9 +1138,317 @@ fn main() {
         sort_by: effective_sort,
         sort_counts_total,
     };
+    (
+        ctx,
+        sort_explicit,
+        implicit_ascending_sort,
+        pin_dot_entries,
+        show_hidden,
+        piped_output,
+    )
+}
+
+fn sort_entries(entries: &mut [EntryInfo], ctx: &Context, reverse_sorted_output: bool) {
+    entries.sort_by(|a, b| {
+        match ctx.sort_by {
+            SortBy::Size => {
+                if a.final_size != b.final_size {
+                    return b.final_size.cmp(&a.final_size);
+                }
+                let a_name = a.display_name.trim_start_matches('.').to_lowercase();
+                let b_name = b.display_name.trim_start_matches('.').to_lowercase();
+                return a_name.cmp(&b_name);
+            }
+            SortBy::Date => {
+                let a_time = a.sort_mtime;
+                let b_time = b.sort_mtime;
+                if a_time != b_time {
+                    return b_time.cmp(&a_time);
+                }
+            }
+            SortBy::Type => {
+                let a_rank = get_custom_type_rank(a);
+                let b_rank = get_custom_type_rank(b);
+                if a_rank != b_rank {
+                    return a_rank.cmp(&b_rank);
+                }
+            }
+            SortBy::DirCount => {
+                let a_count = if ctx.sort_counts_total {
+                    a.dir_count.saturating_add(a.file_count)
+                } else {
+                    a.dir_count
+                };
+                let b_count = if ctx.sort_counts_total {
+                    b.dir_count.saturating_add(b.file_count)
+                } else {
+                    b.dir_count
+                };
+                if a_count != b_count {
+                    return b_count.cmp(&a_count);
+                }
+                if ctx.sort_counts_total && a.dir_count != b.dir_count {
+                    return b.dir_count.cmp(&a.dir_count);
+                }
+            }
+            SortBy::FileCount => {
+                if a.file_count != b.file_count {
+                    return b.file_count.cmp(&a.file_count);
+                }
+            }
+            SortBy::Name => {}
+        }
+        if a.is_hidden != b.is_hidden {
+            return b.is_hidden.cmp(&a.is_hidden);
+        }
+        a.display_name.cmp(&b.display_name)
+    });
+    if reverse_sorted_output {
+        entries.reverse();
+    }
+}
+
+fn emit_entries(
+    cli: &Cli,
+    ctx: &mut Context,
+    mut entries: Vec<EntryInfo>,
+    reverse_sorted_output: bool,
+    pin_dot: bool,
+    cache_raw_enabled: bool,
+) {
+    if entries.is_empty() {
+        if cache_raw_enabled {
+            let _ = write_cache_raw_paths(&[], &[]);
+        }
+        return;
+    }
+
+    let over_auto_limit = entries.len() > AUTO_STYLE_MAX_ENTRIES;
+    ctx.color_enabled = output_enabled(cli.color, !io::stdout().is_terminal(), over_auto_limit);
+    ctx.hyperlink = output_enabled(cli.hyperlink, !io::stdout().is_terminal(), over_auto_limit);
+
+    sort_entries(&mut entries, ctx, reverse_sorted_output);
+    if pin_dot {
+        pin_dot_entries_top(&mut entries);
+    }
+
+    if cache_raw_enabled {
+        let (shown_dir_paths, shown_file_paths) = collect_output_paths(&entries);
+        if let Err(err) = write_cache_raw_paths(&shown_dir_paths, &shown_file_paths) {
+            eprintln!("failed to write --cache-raw files: {}", err);
+        }
+    }
+
+    let detail_columns = build_detail_columns(ctx);
+    let is_list_mode = !io::stdout().is_terminal() || cli.list || cli.header || !detail_columns.is_empty();
+
+    let output = if is_list_mode {
+        print_detailed_list(&entries, ctx, &detail_columns)
+    } else {
+        let mut out = String::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            if idx > 0 {
+                out.push_str("  ");
+            }
+            if entry.is_symlink && entry.broken_symlink {
+                let mut broken_text =
+                    get_display_name_text(&entry.render_name, &entry.metadata, ctx);
+                if ctx.show_targets {
+                    if let Some(target) = entry.symlink_target.as_ref() {
+                        broken_text.push_str(" -> ");
+                        broken_text.push_str(&target.to_string_lossy());
+                    }
+                }
+                out.push_str(&highlight_broken_symlink_text(
+                    &broken_text,
+                    ctx.color_enabled,
+                ));
+            } else {
+                out.push_str(&get_styled_name(
+                    &entry.render_name,
+                    &entry.actual_path,
+                    &entry.metadata,
+                    ctx,
+                ));
+                if ctx.show_targets {
+                    if let Some(target) = entry.symlink_target.as_ref() {
+                        out.push_str(" -> ");
+                        out.push_str(&get_symlink_target_display(
+                            &entry.actual_path,
+                            target,
+                            ctx,
+                        ));
+                    }
+                }
+            }
+        }
+        out.push('\n');
+        out
+    };
+
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(output.as_bytes());
+}
+
+fn render_multiple_paths(cli: Cli) {
+    let (mut ctx, _sort_explicit, implicit_ascending_sort, _pin_dot_entries, show_hidden, piped_output) =
+        build_context_and_sort_state(&cli);
+    let cache_raw_enabled = cli.cache_raw && !piped_output;
+    let need_counts = cli.counts || matches!(ctx.sort_by, SortBy::DirCount | SortBy::FileCount);
+    let now = Local::now();
+    let now_year = now.year();
+    let now_timestamp = now.timestamp();
+    let mut user_cache: HashMap<u32, String> = HashMap::new();
+    let mut group_cache: HashMap<u32, String> = HashMap::new();
     let mut entries = Vec::new();
-    let need_counts = cli.counts || matches!(effective_sort, SortBy::DirCount | SortBy::FileCount);
-    let (recursive_sizes, recursive_counts, root_true_size) = collect_recursive_stats(
+
+    let mut git_status_visible = false;
+    let mut git_repo_visible = false;
+    let mut git_remote_visible = false;
+    let mut git_status_cache: HashMap<PathBuf, HashMap<String, (char, char)>> = HashMap::new();
+    let mut git_repo_marker_cache: HashMap<PathBuf, (Option<char>, Option<char>)> = HashMap::new();
+
+    for path in &cli.paths {
+        let actual_path = PathBuf::from(path);
+        let metadata = match fs::symlink_metadata(&actual_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let is_dirish = metadata.is_dir()
+            || (metadata.file_type().is_symlink()
+                && fs::metadata(&actual_path)
+                    .map(|target| target.is_dir())
+                    .unwrap_or(false));
+        if cli.dirs_only && !is_dirish {
+            continue;
+        }
+
+        let display_name = actual_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        let (recursive_sizes, recursive_counts, root_true_size, root_recursive_counts) = if is_dirish {
+            collect_recursive_stats(
+                &actual_path,
+                show_hidden,
+                cli.dedupe_hardlinks,
+                cli.true_size,
+                need_counts,
+            )
+        } else {
+            (HashMap::new(), HashMap::new(), None, None)
+        };
+
+        let mut entry = create_entry_info(
+            &display_name,
+            actual_path.clone(),
+            metadata,
+            &ctx,
+            &recursive_sizes,
+            &recursive_counts,
+            &mut user_cache,
+            &mut group_cache,
+            now_year,
+            now_timestamp,
+        );
+        if cli.no_traverse && need_counts && is_dirish {
+            let (root_dirs, root_files) = root_recursive_counts.unwrap_or((0, 0));
+            entry.dir_count = root_dirs;
+            entry.file_count = root_files;
+            entry.dir_count_str = root_dirs.to_string();
+            entry.file_count_str = root_files.to_string();
+        }
+        if cli.true_size && is_dirish {
+            if let Some(total_true_size) = root_true_size {
+                entry.true_size_str = format_size(total_true_size);
+                entry.final_size = total_true_size;
+            }
+        }
+
+        if cli.git {
+            let status_base = if is_dirish {
+                actual_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            } else {
+                actual_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            };
+
+            let status_map = git_status_cache.entry(status_base.clone()).or_insert_with(|| {
+                collect_git_statuses_for_listing(&status_base).unwrap_or_default()
+            });
+            if !status_map.is_empty() {
+                git_status_visible = true;
+            }
+            if let Some(status) = status_map.get(&display_name).copied() {
+                entry.git_status = Some(status);
+            } else if git_repo_root(&status_base).is_some() {
+                entry.git_status = Some(('-', '-'));
+                git_status_visible = true;
+            }
+
+            if is_dirish {
+                let markers = git_repo_marker_cache
+                    .entry(actual_path.clone())
+                    .or_insert_with(|| git_repo_root_markers(&actual_path));
+                entry.repo_status = markers.0;
+                entry.repo_remote_status = markers.1;
+                if markers.0.is_some() {
+                    git_repo_visible = true;
+                }
+                if markers.1.is_some() {
+                    git_remote_visible = true;
+                }
+            }
+        }
+
+        entries.push(entry);
+    }
+
+    if cli.git {
+        ctx.show_git = git_status_visible;
+        ctx.show_git_repos = git_repo_visible;
+        ctx.show_git_remote = git_remote_visible;
+        if !ctx.show_git && !ctx.show_git_repos && !ctx.show_git_remote {
+            ctx.show_git = true;
+        }
+    }
+
+    emit_entries(
+        &cli,
+        &mut ctx,
+        entries,
+        cli.reverse ^ implicit_ascending_sort,
+        false,
+        cache_raw_enabled,
+    );
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if cli.paths.len() > 1 {
+        render_multiple_paths(cli);
+        return;
+    }
+    for path in cli.paths.iter().cloned() {
+        let mut path_cli = cli.clone();
+        path_cli.path = path;
+        render_path(path_cli);
+    }
+}
+
+fn render_path(cli: Cli) {
+    let (mut ctx, _sort_explicit, implicit_ascending_sort, pin_dot_entries, show_hidden, piped_output) =
+        build_context_and_sort_state(&cli);
+    let cache_raw_enabled = cli.cache_raw && !piped_output;
+    let mut entries = Vec::new();
+    let need_counts = cli.counts || matches!(ctx.sort_by, SortBy::DirCount | SortBy::FileCount);
+    let (recursive_sizes, recursive_counts, root_true_size, root_recursive_counts) = collect_recursive_stats(
         Path::new(&cli.path),
         show_hidden,
         cli.dedupe_hardlinks,
@@ -1172,7 +1497,7 @@ fn main() {
         return;
     }
 
-    if cli.all && input_is_dir && !cli.directory {
+    if cli.all && input_is_dir && !cli.no_traverse {
         if let Ok(m) = fs::symlink_metadata(&cli.path) {
             entries.push(create_entry_info(
                 ".",
@@ -1210,7 +1535,7 @@ fn main() {
         }
     }
 
-    if input_is_dir && !cli.directory {
+    if input_is_dir && !cli.no_traverse {
         let read_dir = match fs::read_dir(&cli.path) {
             Ok(v) => v,
             Err(_) => return,
@@ -1231,6 +1556,15 @@ fn main() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            if cli.dirs_only
+                && !metadata.is_dir()
+                && !(metadata.file_type().is_symlink()
+                    && fs::metadata(&entry_path)
+                        .map(|target| target.is_dir())
+                        .unwrap_or(false))
+            {
+                continue;
+            }
             entries.push(create_entry_info(
                 &file_name,
                 entry_path,
@@ -1245,6 +1579,15 @@ fn main() {
             ));
         }
     } else if let Some(metadata) = input_meta {
+        if cli.dirs_only
+            && !metadata.is_dir()
+            && !(metadata.file_type().is_symlink()
+                && fs::metadata(input_path)
+                    .map(|target| target.is_dir())
+                    .unwrap_or(false))
+        {
+            return;
+        }
         let file_name = input_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1263,7 +1606,7 @@ fn main() {
         ));
     }
 
-    if cli.all && cli.true_size && input_is_dir && !cli.directory {
+    if cli.all && cli.true_size && input_is_dir && !cli.no_traverse {
         let dot_true_size = root_true_size.unwrap_or_else(|| {
             recursive_dir_on_disk_size(Path::new(&cli.path), show_hidden, cli.dedupe_hardlinks)
         });
@@ -1272,12 +1615,21 @@ fn main() {
             dot_entry.final_size = dot_true_size;
         }
     }
-    if cli.directory && cli.true_size && input_is_dir {
+    if cli.no_traverse && cli.true_size && input_is_dir {
         if let Some(dir_entry) = entries.get_mut(0) {
             if let Some(total_true_size) = root_true_size {
                 dir_entry.true_size_str = format_size(total_true_size);
                 dir_entry.final_size = total_true_size;
             }
+        }
+    }
+    if cli.no_traverse && need_counts && input_is_dir {
+        if let Some(dir_entry) = entries.get_mut(0) {
+            let (root_dirs, root_files) = root_recursive_counts.unwrap_or((0, 0));
+            dir_entry.dir_count = root_dirs;
+            dir_entry.file_count = root_files;
+            dir_entry.dir_count_str = root_dirs.to_string();
+            dir_entry.file_count_str = root_files.to_string();
         }
     }
 
@@ -1286,74 +1638,6 @@ fn main() {
             let _ = write_cache_raw_paths(&[], &[]);
         }
         return;
-    }
-
-    let over_auto_limit = entries.len() > AUTO_STYLE_MAX_ENTRIES;
-    ctx.color_enabled = output_enabled(cli.color, piped_output, over_auto_limit);
-    ctx.hyperlink = output_enabled(cli.hyperlink, piped_output, over_auto_limit);
-
-    let reverse_sorted_output = cli.reverse ^ implicit_ascending_sort;
-    entries.sort_by(|a, b| {
-        match ctx.sort_by {
-            SortBy::Size => {
-                if a.final_size != b.final_size {
-                    return b.final_size.cmp(&a.final_size);
-                }
-                let a_name = a.display_name.trim_start_matches('.').to_lowercase();
-                let b_name = b.display_name.trim_start_matches('.').to_lowercase();
-                return a_name.cmp(&b_name);
-            }
-            SortBy::Date => {
-                let a_time = a.sort_mtime;
-                let b_time = b.sort_mtime;
-                if a_time != b_time {
-                    return b_time.cmp(&a_time);
-                }
-            }
-            SortBy::Type => {
-                let a_rank = get_custom_type_rank(a);
-                let b_rank = get_custom_type_rank(b);
-                if a_rank != b_rank {
-                    return a_rank.cmp(&b_rank);
-                }
-            }
-            SortBy::DirCount => {
-                let a_count = if ctx.sort_counts_total {
-                    a.dir_count.saturating_add(a.file_count)
-                } else {
-                    a.dir_count
-                };
-                let b_count = if ctx.sort_counts_total {
-                    b.dir_count.saturating_add(b.file_count)
-                } else {
-                    b.dir_count
-                };
-                if a_count != b_count {
-                    return b_count.cmp(&a_count);
-                }
-                if ctx.sort_counts_total && a.dir_count != b.dir_count {
-                    // For implicit -c total sorting, ties prefer files over dirs
-                    // in ascending output after the final reverse pass.
-                    return b.dir_count.cmp(&a.dir_count);
-                }
-            }
-            SortBy::FileCount => {
-                if a.file_count != b.file_count {
-                    return b.file_count.cmp(&a.file_count);
-                }
-            }
-            SortBy::Name => {}
-        }
-        if a.is_hidden != b.is_hidden {
-            return b.is_hidden.cmp(&a.is_hidden);
-        }
-        a.display_name.cmp(&b.display_name)
-    });
-    if reverse_sorted_output {
-        entries.reverse();
-    }
-    if cli.all && input_is_dir && pin_dot_entries {
-        pin_dot_entries_top(&mut entries);
     }
 
     if cli.git {
@@ -1369,62 +1653,14 @@ fn main() {
         }
     }
 
-    if cache_raw_enabled {
-        let (shown_dir_paths, shown_file_paths) = collect_output_paths(&entries);
-        if let Err(err) = write_cache_raw_paths(&shown_dir_paths, &shown_file_paths) {
-            eprintln!("failed to write --cache-raw files: {}", err);
-        }
-    }
-
-    let detail_columns = build_detail_columns(&ctx);
-    let is_list_mode = piped_output || cli.list || cli.header || !detail_columns.is_empty();
-
-    let output = if is_list_mode {
-        print_detailed_list(&entries, &ctx, &detail_columns)
-    } else {
-        let mut out = String::new();
-        for (idx, entry) in entries.iter().enumerate() {
-            if idx > 0 {
-                out.push_str("  ");
-            }
-            if entry.is_symlink && entry.broken_symlink {
-                let mut broken_text =
-                    get_display_name_text(&entry.render_name, &entry.metadata, &ctx);
-                if ctx.show_targets {
-                    if let Some(target) = entry.symlink_target.as_ref() {
-                        broken_text.push_str(" -> ");
-                        broken_text.push_str(&target.to_string_lossy());
-                    }
-                }
-                out.push_str(&highlight_broken_symlink_text(
-                    &broken_text,
-                    ctx.color_enabled,
-                ));
-            } else {
-                out.push_str(&get_styled_name(
-                    &entry.render_name,
-                    &entry.actual_path,
-                    &entry.metadata,
-                    &ctx,
-                ));
-                if ctx.show_targets {
-                    if let Some(target) = entry.symlink_target.as_ref() {
-                        out.push_str(" -> ");
-                        out.push_str(&get_symlink_target_display(
-                            &entry.actual_path,
-                            target,
-                            &ctx,
-                        ));
-                    }
-                }
-            }
-        }
-        out.push('\n');
-        out
-    };
-
-    let mut stdout = io::stdout().lock();
-    let _ = stdout.write_all(output.as_bytes());
+    emit_entries(
+        &cli,
+        &mut ctx,
+        entries,
+        cli.reverse ^ implicit_ascending_sort,
+        cli.all && input_is_dir && pin_dot_entries,
+        cache_raw_enabled,
+    );
 }
 
 fn collect_output_paths(entries: &[EntryInfo]) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -2121,6 +2357,7 @@ fn collect_recursive_stats_ntfs_mft(
     HashMap<OsString, u64>,
     HashMap<OsString, (u64, u64)>,
     Option<u64>,
+    Option<(u64, u64)>,
 )> {
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
     let mount = detect_mount_info(&canonical_base)
@@ -2153,6 +2390,8 @@ fn collect_recursive_stats_ntfs_mft(
     let mut recursive_sizes: HashMap<OsString, u64> = HashMap::new();
     let mut recursive_counts: HashMap<OsString, (u64, u64)> = HashMap::new();
     let mut top_level_dirs: Vec<(OsString, u64)> = Vec::new();
+    let mut root_dirs_count = 0u64;
+    let mut root_files_count = 0u64;
     let shared_seen = if need_sizes && dedupe_hardlinks {
         Some(Arc::new(Mutex::new(HashSet::<u64>::new())))
     } else {
@@ -2202,6 +2441,9 @@ fn collect_recursive_stats_ntfs_mft(
         let child_is_reparse = ntfs_is_reparse_point(&child_file, &mut device);
 
         if child_is_dir && !child_is_reparse {
+            if need_counts {
+                root_dirs_count += 1;
+            }
             top_level_dirs.push((OsString::from(name), child_record));
         } else if need_sizes {
             let mut include_size = true;
@@ -2214,6 +2456,11 @@ fn collect_recursive_stats_ntfs_mft(
                 root_recursive_size +=
                     round_up_to_block(ntfs_file_logical_size(&child_file, &mut device), block_size);
             }
+            if need_counts {
+                root_files_count += 1;
+            }
+        } else if need_counts {
+            root_files_count += 1;
         }
     }
 
@@ -2271,6 +2518,8 @@ fn collect_recursive_stats_ntfs_mft(
             root_recursive_size += size;
         }
         if need_counts {
+            root_dirs_count += dirs_count;
+            root_files_count += file_count;
             recursive_counts.insert(name, (dirs_count, file_count));
         }
     }
@@ -2280,6 +2529,11 @@ fn collect_recursive_stats_ntfs_mft(
         recursive_counts,
         if need_sizes {
             Some(root_recursive_size)
+        } else {
+            None
+        },
+        if need_counts {
+            Some((root_dirs_count, root_files_count))
         } else {
             None
         },
@@ -2375,9 +2629,10 @@ fn collect_recursive_stats_ntfs(
     HashMap<OsString, u64>,
     HashMap<OsString, (u64, u64)>,
     Option<u64>,
+    Option<(u64, u64)>,
 ) {
     if !need_sizes && !need_counts {
-        return (HashMap::new(), HashMap::new(), None);
+        return (HashMap::new(), HashMap::new(), None, None);
     }
 
     let ntfs_debug = std::env::var_os("TWIG_NTFS_DEBUG").is_some();
@@ -2405,6 +2660,8 @@ fn collect_recursive_stats_ntfs(
     let mut recursive_sizes: HashMap<OsString, u64> = HashMap::new();
     let mut recursive_counts: HashMap<OsString, (u64, u64)> = HashMap::new();
     let mut top_level_dirs: Vec<(OsString, PathBuf)> = Vec::new();
+    let mut root_dirs_count = 0u64;
+    let mut root_files_count = 0u64;
     let available_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -2435,6 +2692,11 @@ fn collect_recursive_stats_ntfs(
                 recursive_counts,
                 if need_sizes {
                     Some(root_recursive_size)
+                } else {
+                    None
+                },
+                if need_counts {
+                    Some((root_dirs_count, root_files_count))
                 } else {
                     None
                 },
@@ -2469,7 +2731,12 @@ fn collect_recursive_stats_ntfs(
             Err(_) => continue,
         };
         if file_type.is_dir() {
+            if need_counts {
+                root_dirs_count += 1;
+            }
             top_level_dirs.push((name, child_path));
+        } else if need_counts {
+            root_files_count += 1;
         }
     }
 
@@ -2518,6 +2785,8 @@ fn collect_recursive_stats_ntfs(
             root_recursive_size += size;
         }
         if need_counts {
+            root_dirs_count += dirs;
+            root_files_count += files;
             recursive_counts.insert(name, (dirs, files));
         }
     }
@@ -2527,6 +2796,11 @@ fn collect_recursive_stats_ntfs(
         recursive_counts,
         if need_sizes {
             Some(root_recursive_size)
+        } else {
+            None
+        },
+        if need_counts {
+            Some((root_dirs_count, root_files_count))
         } else {
             None
         },
@@ -2543,9 +2817,10 @@ fn collect_recursive_stats(
     HashMap<OsString, u64>,
     HashMap<OsString, (u64, u64)>,
     Option<u64>,
+    Option<(u64, u64)>,
 ) {
     if !need_sizes && !need_counts {
-        return (HashMap::new(), HashMap::new(), None);
+        return (HashMap::new(), HashMap::new(), None, None);
     }
 
     let canonical_base = fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
@@ -2562,6 +2837,12 @@ fn collect_recursive_stats(
     // Top-level keyed aggregation: key is immediate child directory name.
     let dir_local_stats = Arc::new(Mutex::new(HashMap::<OsString, (u64, u64, u64)>::new()));
     let shared_stats = Arc::clone(&dir_local_stats);
+    let root_counts_total = if need_counts {
+        Some(Arc::new(Mutex::new((0u64, 0u64))))
+    } else {
+        None
+    };
+    let shared_root_counts = root_counts_total.as_ref().map(Arc::clone);
     let root_size_total = if need_sizes {
         let initial = fs::symlink_metadata(&canonical_base)
             .map(|m| on_disk_size(&m))
@@ -2596,12 +2877,21 @@ fn collect_recursive_stats(
 
             let mut local_updates: HashMap<OsString, (u64, u64, u64)> = HashMap::new();
             let mut callback_size = 0u64;
+            let mut callback_dirs = 0u64;
+            let mut callback_files = 0u64;
 
             // Root callback: seed top-level dir entries and add each top-level dir's own size.
             if first_component.is_none() {
                 let mut hardlink_candidates: Vec<(u64, u64, u64)> = Vec::new();
                 for child in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
                     let ft = child.file_type();
+                    if need_counts {
+                        if ft.is_dir() {
+                            callback_dirs += 1;
+                        } else {
+                            callback_files += 1;
+                        }
+                    }
                     if !need_sizes {
                         continue;
                     }
@@ -2679,6 +2969,8 @@ fn collect_recursive_stats(
                 }
 
                 callback_size = local_size;
+                callback_dirs = local_dirs;
+                callback_files = local_files;
                 local_updates.insert(top_level_name, (local_size, local_dirs, local_files));
             }
 
@@ -2696,6 +2988,15 @@ fn collect_recursive_stats(
                     entry.0 += value.0;
                     entry.1 += value.1;
                     entry.2 += value.2;
+                }
+            }
+
+            if let Some(ref root_counts) = shared_root_counts {
+                if (callback_dirs > 0 || callback_files > 0)
+                    && let Ok(mut totals) = root_counts.lock()
+                {
+                    totals.0 += callback_dirs;
+                    totals.1 += callback_files;
                 }
             }
         })
@@ -2727,8 +3028,21 @@ fn collect_recursive_stats(
     } else {
         None
     };
+    let root_recursive_counts = if need_counts {
+        root_counts_total.map(|shared| match Arc::try_unwrap(shared) {
+            Ok(mutex) => mutex.into_inner().unwrap_or((0, 0)),
+            Err(shared_again) => shared_again.lock().map(|v| *v).unwrap_or((0, 0)),
+        })
+    } else {
+        None
+    };
 
-    (recursive_sizes, recursive_counts, root_recursive_size)
+    (
+        recursive_sizes,
+        recursive_counts,
+        root_recursive_size,
+        root_recursive_counts,
+    )
 }
 
 fn recursive_dir_on_disk_size(base_path: &Path, show_hidden: bool, dedupe_hardlinks: bool) -> u64 {
@@ -2954,6 +3268,22 @@ fn print_detailed_list(entries: &[EntryInfo], ctx: &Context, columns: &[DetailCo
         max_group = max_group.max(e.group_str.len());
         max_time = max_time.max(e.time_str.len());
     }
+    let mut git_col_width = 0usize;
+    if ctx.show_git {
+        git_col_width += 2;
+    }
+    if ctx.show_git_repos {
+        if git_col_width > 0 {
+            git_col_width += 1;
+        }
+        git_col_width += 1;
+    }
+    if ctx.show_git_remote {
+        if git_col_width > 0 {
+            git_col_width += 1;
+        }
+        git_col_width += 1;
+    }
     if ctx.header {
         max_size_logical = max_size_logical.max("SIZE".len());
         max_size_true = max_size_true.max("TSIZE".len());
@@ -2997,7 +3327,7 @@ fn print_detailed_list(entries: &[EntryInfo], ctx: &Context, columns: &[DetailCo
                     header.push_str(&format!("{:<width$}", "GROUP", width = max_group));
                 }
                 DetailColumn::Git => {
-                    header.push_str("GIT");
+                    header.push_str(&format!("{:<width$}", "GIT", width = git_col_width.max(3)));
                 }
             }
         }
@@ -3102,25 +3432,25 @@ fn print_detailed_list(entries: &[EntryInfo], ctx: &Context, columns: &[DetailCo
                             ctx.color_enabled,
                         ));
                     }
-                    if ctx.show_git_repos {
-                        if ctx.show_git {
-                            row.push(' ');
-                        }
-                        let repo_status = e.repo_status.unwrap_or(' ');
-                        row.push_str(&paint_if_enabled(
-                            git_repo_status_style(repo_status),
-                            &repo_status.to_string(),
-                            ctx.color_enabled,
-                        ));
-                    }
                     if ctx.show_git_remote {
-                        if ctx.show_git || ctx.show_git_repos {
+                        if ctx.show_git {
                             row.push(' ');
                         }
                         let remote_status = e.repo_remote_status.unwrap_or(' ');
                         row.push_str(&paint_if_enabled(
                             git_remote_status_style(remote_status),
                             &remote_status.to_string(),
+                            ctx.color_enabled,
+                        ));
+                    }
+                    if ctx.show_git_repos {
+                        if ctx.show_git || ctx.show_git_remote {
+                            row.push(' ');
+                        }
+                        let repo_status = e.repo_status.unwrap_or(' ');
+                        row.push_str(&paint_if_enabled(
+                            git_repo_status_style(repo_status),
+                            &repo_status.to_string(),
                             ctx.color_enabled,
                         ));
                     }
