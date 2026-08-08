@@ -4,7 +4,7 @@
 
 ## Justification
 
-1. When piping or when there are >1000 entries in the listing, `--color=auto` and `--hyperlink=auto` flags do not apply colour or hyperlinks, and instead use a fast mode.  
+1. Eligible plain and long listings use dedicated `std::fs::read_dir` fast paths. When piping or when there are >1000 entries in the listing, `--color=auto` and `--hyperlink=auto` do not apply colour or hyperlinks.
    - Benchmarking with hyperlinks and colours disabled on all `twig` is **2–3× faster** than `/bin/ls` (with `twig -la` same speed as `/bin/ls -la`) and **8–12× faster** than `eza` (with `twig -la` **1.5× faster** than `eza -la`).  
    - With hyperlinks and colour forced on both, `twig` is **4× faster** than `eza` with hyperlinks and colour (with `twig -la` **2.2× faster** than `eza -la`).
 2. On NTFS-like mounts, recursive stats (`-S`, `-c`, `--sort dircount|filecount`) attempt an MFT-based fast path first, then automatically fall back to regular filesystem scanning when unavailable.
@@ -20,6 +20,8 @@
 12. `-a -S` shows `.` (not `..`) and gives `.` full recursive true size.
 13. `-s` in `twig` shows logical size of files and allocated blocks for directories and `-S` shows allocated block size of files and true recursive sizes of directories.
 14. `-H`, `--no-dedupe-hardlinks` – toggle for `-S` hardlink deduplication.
+15. Recursive totals include hidden descendants even when hidden entries are not displayed.
+16. `--git-fetch` fetches the current repository when inside one, plus immediate child repository roots.
 
 ## Project Structure
 
@@ -30,23 +32,37 @@
 ├── Cargo.toml          # crate metadata and dependencies
 ├── Cargo.lock          # locked dependency graph
 ├── src/
-│   └── main.rs         # all CLI parsing, scanning, metadata collection, rendering
+│   ├── main.rs         # process entry point and module wiring
+│   ├── app.rs          # listing orchestration, sorting, entry construction and cache coordination
+│   ├── cli.rs          # Clap options, flag-order semantics and resolved display context
+│   ├── fs_ops.rs       # metadata, recursive size/count collection and NTFS/MFT paths
+│   ├── git.rs          # Git status, repository markers, remote state and fetch operations
+│   ├── model.rs        # shared entry and filesystem data structures
+│   └── render.rs       # fast paths, detailed/grid output, styling and hyperlinks
 └── target/             # build artifacts (ignored in git)
 ```
 
 ### File Responsibilities
 
 - `src/main.rs`
-  - Defines CLI flags/options (`clap` derive)
-  - Scans visible listing entries with `std::fs::read_dir` (one level)
-  - Uses `jwalk` for recursive fallback aggregation paths
-  - Computes size fields (`-s` vs `-S`)
-  - Computes recursive stats for `-S`, `-c`, and `--sort dircount|filecount`
-  - Detects NTFS mounts and attempts an MFT recursive scanner
-  - Computes Git columns (`--git`)
-  - Styles output using `LS_COLORS`
-  - Handles symlink arrows/targets and broken-link highlighting
-  - Writes optional raw path caches for shell integration
+  - Starts the process and delegates to the application module.
+- `src/app.rs`
+  - Collects one or multiple listing paths, sorts entries, builds display records,
+    coordinates Git metadata, and emits output.
+- `src/cli.rs`
+  - Defines Clap flags and preserves flag-order behavior for column order and
+    implicit sorting.
+- `src/fs_ops.rs`
+  - Reads metadata, computes recursive sizes/counts, and selects the NTFS MFT
+    path or filesystem walker.
+- `src/git.rs`
+  - Computes file status, repository markers, remote state, and `--git-fetch`
+    behavior.
+- `src/model.rs`
+  - Contains shared entry and mount data structures passed between modules.
+- `src/render.rs`
+  - Owns the large-directory fast paths, list/grid rendering, LS_COLORS,
+    hyperlinks, symlink targets, permissions, sizes, and raw path caches.
 - `.cargo/config.toml`
   - Enables `-C target-cpu=native` for local optimized builds
 
@@ -82,10 +98,11 @@ From `twig --help`:
 - `-A, --almost-all` list hidden but exclude `.` and `..`
 - `-l, --long` shorthand for `-Lptos --show-targets`
 - `-L, --list` force one-entry-per-line list mode
-- `-d, --directory` list a directory entry itself (do not list its contents)
+- `-d, --dirs-only` show only directories in the listed folder
+- `-n, --no-traverse` list a directory entry itself (do not list its contents)
 - `-p, --permissions` show permission bits
 - `-s, --size` show logical file size and allocated dir size
-- `-c, --counts` show recursive dir/file counts for directory entries
+- `-c, --counts` show recursive dir/file counts for directory entries; auto-sorts by total files + dirs ascending
 - `-o, --owner` show file owner
 - `-g, --group` show group
 - `-t, --modified` show mtime
@@ -98,9 +115,10 @@ From `twig --help`:
 - `-G, --git` smart Git columns:
   - file staged/unstaged status when listing path is in a Git repo
   - repo-root status markers when listed entries include Git repo roots
-- `-D, --dereference` use symlink target size/time fields for `-s`/`-S`/`-t`
-- `-S, --true-size` show allocated file size + recursive allocated dir size
+- `-1, --dereference` use symlink target size/time fields for `-s`/`-S`/`-t`
+- `-S, --true-size` show allocated file size + recursive allocated dir size; auto-sorts by size ascending
 - `-H, --no-dedupe-hardlinks` disable hardlink dedupe for `-S`
+- `-f, --git-fetch` fetch the current and immediately nested Git repositories
 - `--header` show list headers (moved to bottom with `-r`)
 - `--color <always|auto|never>` control ANSI color rendering
 - `--cache-raw` write listed full paths for dirs/files to `/tmp/fzf-history-$USER/...`
@@ -320,7 +338,7 @@ Core crates:
 ## Notes and Limits
 
 - Current listing depth is one directory level.
-- Git status is computed via `git status --porcelain=v1`.
+- Git status is computed via NUL-delimited `git status --porcelain=v1 -z` records.
 - Repo-root marker is shown only for directories that are Git toplevel roots.
 - Size units are decimal text with `K/M/G` suffixes, one decimal above bytes.
 - `--cache-raw` is disabled automatically when stdout is not a TTY.
@@ -331,6 +349,10 @@ Core crates:
 ```bash
 cargo fmt
 cargo build --release
+cargo test
 ```
 
-No separate test suite is included currently; behavior is validated via targeted fixture directories and manual command checks.
+Unit tests cover CLI aliases and mode separation, Git status translation,
+filesystem block rounding/hidden-name handling, and rendering path/size
+formatting. Larger output behavior is still checked with fixture directories
+and manual command checks.
